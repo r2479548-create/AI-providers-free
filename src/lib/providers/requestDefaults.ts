@@ -1,4 +1,8 @@
 type JsonRecord = Record<string, unknown>;
+const CLAUDE_CODE_COMPATIBLE_PROVIDER_PREFIX = "anthropic-compatible-cc-";
+
+import { normalizeExcludedModelPatterns } from "@/domain/connectionModelRules";
+import { normalizeRoutingTags } from "@/domain/tagRouter";
 
 export const CODEX_REASONING_EFFORT_VALUES = ["none", "low", "medium", "high", "xhigh"] as const;
 
@@ -16,8 +20,22 @@ function normalizeString(value: unknown): string | undefined {
   return normalized || undefined;
 }
 
+const BEDROCK_REGION_PATTERN = /^[a-z]{2}(?:-gov)?-[a-z]+-\d+$/i;
+
+function normalizeAwsRegion(value: unknown): string | undefined {
+  const normalized = normalizeString(value);
+  if (!normalized || !BEDROCK_REGION_PATTERN.test(normalized)) return undefined;
+  return normalized;
+}
+
 function hasNonEmptyString(value: unknown): boolean {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function isClaudeCodeCompatibleProvider(provider: string | null | undefined): boolean {
+  return (
+    typeof provider === "string" && provider.startsWith(CLAUDE_CODE_COMPATIBLE_PROVIDER_PREFIX)
+  );
 }
 
 export function normalizeCodexReasoningEffort(value: unknown): CodexReasoningEffort | undefined {
@@ -28,11 +46,18 @@ export function normalizeCodexReasoningEffort(value: unknown): CodexReasoningEff
   return normalized as CodexReasoningEffort;
 }
 
-export function normalizeCodexServiceTier(value: unknown): "priority" | undefined {
+export type CodexServiceTier = "default" | "priority" | "flex";
+
+export function normalizeCodexServiceTier(value: unknown): CodexServiceTier | undefined {
   const normalized = normalizeString(value);
   if (!normalized) return undefined;
   if (normalized === "fast" || normalized === "priority") return "priority";
+  if (normalized === "default" || normalized === "flex") return normalized;
   return undefined;
+}
+
+export function normalizeClaudeCodeCompatibleContext1m(value: unknown): true | undefined {
+  return value === true ? true : undefined;
 }
 
 export function normalizeRequestDefaults(
@@ -57,6 +82,15 @@ export function normalizeRequestDefaults(
       normalized.serviceTier = serviceTier;
     } else {
       delete normalized.serviceTier;
+    }
+  }
+
+  if (isClaudeCodeCompatibleProvider(provider)) {
+    const context1m = normalizeClaudeCodeCompatibleContext1m(record.context1m);
+    if (context1m) {
+      normalized.context1m = true;
+    } else {
+      delete normalized.context1m;
     }
   }
 
@@ -85,7 +119,71 @@ export function normalizeProviderSpecificData(
     delete normalized.openaiStoreEnabled;
   }
 
+  if ("blockExtraUsage" in normalized && typeof normalized.blockExtraUsage !== "boolean") {
+    delete normalized.blockExtraUsage;
+  }
+
+  if ("autoFetchModels" in normalized && typeof normalized.autoFetchModels !== "boolean") {
+    delete normalized.autoFetchModels;
+  }
+
+  if (provider === "bedrock" && "region" in normalized) {
+    const region = normalizeAwsRegion(normalized.region);
+    if (region) {
+      normalized.region = region;
+    } else {
+      delete normalized.region;
+    }
+  }
+
+  if ("tag" in normalized) {
+    if (typeof normalized.tag === "string") {
+      const trimmedTag = normalized.tag.trim();
+      if (trimmedTag) {
+        normalized.tag = trimmedTag;
+      } else {
+        delete normalized.tag;
+      }
+    } else {
+      delete normalized.tag;
+    }
+  }
+
+  if ("tags" in normalized) {
+    const tags = normalizeRoutingTags(normalized.tags);
+    if (tags.length > 0) {
+      normalized.tags = tags;
+    } else {
+      delete normalized.tags;
+    }
+  }
+
+  if ("excludedModels" in normalized || "excluded_models" in normalized) {
+    const excludedModels = normalizeExcludedModelPatterns(
+      normalized.excludedModels ?? normalized.excluded_models
+    );
+    if (excludedModels.length > 0) {
+      normalized.excludedModels = excludedModels;
+    } else {
+      delete normalized.excludedModels;
+    }
+    delete normalized.excluded_models;
+  }
+
   return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+export function sanitizeProviderSpecificDataForResponse(value: unknown): JsonRecord | undefined {
+  const record = asRecord(value);
+  if (Object.keys(record).length === 0) return undefined;
+
+  const sanitized: JsonRecord = { ...record };
+  delete sanitized.consoleApiKey;
+  delete sanitized.secretAccessKey;
+  delete sanitized.awsSecretAccessKey;
+  delete sanitized.sessionToken;
+  delete sanitized.awsSessionToken;
+  return sanitized;
 }
 
 export function isOpenAIResponsesStoreEnabled(providerSpecificData: unknown): boolean {
@@ -141,7 +239,7 @@ export function getProviderRequestDefaults(
 
 export function getCodexRequestDefaults(providerSpecificData: unknown): {
   reasoningEffort?: CodexReasoningEffort;
-  serviceTier?: "priority";
+  serviceTier?: CodexServiceTier;
 } {
   const defaults = getProviderRequestDefaults("codex", providerSpecificData);
   const reasoningEffort = normalizeCodexReasoningEffort(defaults.reasoningEffort);
@@ -149,5 +247,18 @@ export function getCodexRequestDefaults(providerSpecificData: unknown): {
   return {
     ...(reasoningEffort ? { reasoningEffort } : {}),
     ...(serviceTier ? { serviceTier } : {}),
+  };
+}
+
+export function getClaudeCodeCompatibleRequestDefaults(providerSpecificData: unknown): {
+  context1m?: true;
+} {
+  const defaults = getProviderRequestDefaults(
+    "anthropic-compatible-cc-default",
+    providerSpecificData
+  );
+  const context1m = normalizeClaudeCodeCompatibleContext1m(defaults.context1m);
+  return {
+    ...(context1m ? { context1m } : {}),
   };
 }

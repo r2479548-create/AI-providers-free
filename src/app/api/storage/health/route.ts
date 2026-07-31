@@ -8,6 +8,8 @@ import {
   getCallLogsTableMaxRows,
   getProxyLogsTableMaxRows,
 } from "@/lib/logEnv";
+import { getDbBackupMaxFiles, getDbBackupRetentionDays } from "@/lib/db/backup";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 /**
  * GET /api/storage/health — Return database storage information.
@@ -70,10 +72,14 @@ export async function GET() {
         callLogs: getCallLogsTableMaxRows(),
         proxyLogs: getProxyLogsTableMaxRows(),
       },
+      backupRetention: {
+        maxFiles: getDbBackupMaxFiles(),
+        days: getDbBackupRetentionDays(),
+      },
       dataDir: dataDir.startsWith(homeDir) ? "~" + dataDir.slice(homeDir.length) : dataDir,
     });
   } catch (error) {
     console.error("[API] Error getting storage health:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
 }

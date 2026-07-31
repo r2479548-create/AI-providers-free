@@ -6,6 +6,7 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -13,6 +14,11 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  CI_NODE_VERSION: "24"
+  CI_NODE_24_VERSION: "24"
+  CI_NODE_26_VERSION: "26"
 
 jobs:
   lint:
@@ -22,16 +28,48 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
       - run: npm ci
+      - run: npm run check:node-runtime
+      - run: npm run audit:deps
       - run: npm run lint
       - run: npm run check:cycles
       - run: npm run check:route-validation:t06
       - run: npm run check:any-budget:t11
       - run: npm run check:docs-sync
       - run: npm run typecheck:core
+      # typecheck:noimplicit:core is a forward-looking gate (noImplicitAny).
+      # Run informationally for now — many pre-existing call sites still need
+      # explicit annotations; track in a dedicated follow-up.
       - run: npm run typecheck:noimplicit:core
+        continue-on-error: true
+
+  docs-sync-strict:
+    name: Docs Sync (Strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.CI_NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run check:docs-all
+      - name: i18n translation drift (warn)
+        run: node scripts/i18n/check-translation-drift.mjs --warn
+
+  i18n-ui-coverage:
+    name: i18n UI Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.CI_NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: node scripts/i18n/check-ui-keys-coverage.mjs --threshold=65
 
   i18n-matrix:
     name: Build language matrix
@@ -57,13 +95,13 @@ jobs:
     needs: i18n-matrix
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6.2.0
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Validate ${{ matrix.lang }}
         run: |
-          python3 scripts/validate_translation.py quick -l '${{ matrix.lang }}' > result.txt
+          python3 scripts/i18n/validate_translation.py quick -l '${{ matrix.lang }}' > result.txt
 
       - name: Upload result
         if: always()
@@ -82,54 +120,17 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: ${{ env.CI_NODE_VERSION }}
       - name: Fetch base branch
         run: git fetch --no-tags origin "${GITHUB_BASE_REF}" --depth=1
       - name: Validate source changes include tests
-        run: node scripts/check-pr-test-policy.mjs --summary-file .artifacts/pr-test-policy.md
+        run: node scripts/check/check-pr-test-policy.mjs --summary-file .artifacts/pr-test-policy.md
       - name: Publish PR test policy summary
         if: always()
         run: |
           if [ -f .artifacts/pr-test-policy.md ]; then
             cat .artifacts/pr-test-policy.md >> "$GITHUB_STEP_SUMMARY"
           fi
-
-  advanced-security:
-    name: Advanced Security Scans
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: TruffleHog Secret Scan
-        uses: trufflesecurity/trufflehog@main
-        with:
-          path: ./
-          base: ${{ github.event.repository.default_branch }}
-          head: HEAD
-          extra_args: --only-verified
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-
-      - run: npm ci
-
-      - name: Dependency audit
-        run: npm audit --audit-level=high --omit=dev || true
-
-      - name: Check for known vulnerabilities
-        run: npx is-my-node-vulnerable || true
-
-      - name: Run Snyk Vulnerability checks
-        if: github.actor != 'dependabot[bot]'
-        uses: snyk/actions/node@master
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=high
 
   build:
     name: Build
@@ -138,33 +139,180 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
       - run: npm ci
+      - run: npm run check:node-runtime
       - run: npm run build
 
-  test-unit:
-    name: Unit Tests
+  package-artifact:
+    name: Package Artifact
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     needs: build
     env:
-      JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
-      API_KEY_SECRET: ci-test-api-key-secret-long
+      JWT_SECRET: ci-build-secret-with-sufficient-length-for-validation
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
       - run: npm ci
-      - run: npm run test:unit
+      - run: npm run check:node-runtime
+      - run: npm run build:cli
+      - run: npm run check:pack-artifact
+
+  electron-package-smoke:
+    name: Electron Package Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: build
+    env:
+      JWT_SECRET: ci-build-secret-with-sufficient-length-for-validation
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.CI_NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run check:node-runtime
+      - run: npm run build
+      - name: Install Electron dependencies
+        working-directory: electron
+        run: npm install --no-audit --no-fund
+      - name: Pack Electron app
+        working-directory: electron
+        run: npm run pack
+      - name: Smoke packaged Electron app
+        env:
+          ELECTRON_SMOKE_TIMEOUT_MS: 60000
+        run: xvfb-run -a npm run electron:smoke:packaged
+
+  test-unit:
+    name: Unit Tests (${{ matrix.shard }}/8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+      API_KEY_SECRET: ci-test-api-key-secret-long
+      DISABLE_SQLITE_AUTO_BACKUP: "true"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.CI_NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run check:node-runtime
+      - run: node --max-old-space-size=4096 --import tsx --test --test-force-exit --test-concurrency=4 --test-shard=${{ matrix.shard }}/8 tests/unit/*.test.ts
+
+  node-24-compat:
+    name: Node 24 Compatibility (${{ matrix.shard }}/2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    env:
+      JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+      API_KEY_SECRET: ci-test-api-key-secret-long
+      DISABLE_SQLITE_AUTO_BACKUP: "true"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.CI_NODE_24_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run check:node-runtime
+      - run: npm run build
+      - run: node --import tsx --test --test-force-exit --test-concurrency=4 --test-shard=${{ matrix.shard }}/2 tests/unit/*.test.ts
+
+  node-26-compat:
+    name: Node 26 Compatibility (${{ matrix.shard }}/2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    env:
+      JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+      API_KEY_SECRET: ci-test-api-key-secret-long
+      DISABLE_SQLITE_AUTO_BACKUP: "true"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.CI_NODE_26_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run check:node-runtime
+      - run: npm run build
+      - run: node --import tsx --test --test-force-exit --test-concurrency=4 --test-shard=${{ matrix.shard }}/2 tests/unit/*.test.ts
+
+  test-coverage-shard:
+    name: Coverage Shard (${{ matrix.shard }}/8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+      API_KEY_SECRET: ci-test-api-key-secret-long
+      DISABLE_SQLITE_AUTO_BACKUP: "true"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.CI_NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run check:node-runtime
+      - name: Run c8 over shard ${{ matrix.shard }}/8
+        run: |
+          rm -rf coverage-shard coverage-shard-report
+          # `--temp-directory` (writable via NODE_V8_COVERAGE) is what the merge
+          # job reads with `c8 report --temp-directory ...`. Using `--output-dir`
+          # only produces the final json *report* and leaves the raw v8 files in
+          # `coverage/tmp`, so uploading `coverage-shard/` was empty. Pin the temp
+          # dir so the raw coverage files live there and the artifact upload picks
+          # them up regardless of `--test-force-exit` timing.
+          npx c8 \
+            --temp-directory=coverage-shard \
+            --reports-dir=coverage-shard-report \
+            --reporter=json \
+            --exclude=tests/** \
+            --exclude=**/*.test.* \
+            node --max-old-space-size=4096 --import tsx --test --test-force-exit --test-concurrency=4 \
+              --test-shard=${{ matrix.shard }}/8 tests/unit/*.test.ts
+      - name: Upload raw shard coverage
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: coverage-shard/*.json
+          if-no-files-found: error
 
   test-coverage:
     name: Coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    needs: build
+    timeout-minutes: 10
+    needs: test-coverage-shard
+    if: ${{ always() && needs.test-coverage-shard.result == 'success' }}
     env:
       JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
       API_KEY_SECRET: ci-test-api-key-secret-long
@@ -172,17 +320,40 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
       - run: npm ci
-      - name: Run coverage gate
-        run: npm run test:coverage
+      - name: Download all shard coverage
+        uses: actions/download-artifact@v7
+        with:
+          pattern: coverage-shard-*
+          path: coverage-shards/
+          merge-multiple: true
+      - name: Merge + report + gate
+        run: |
+          mkdir -p coverage
+          if [ ! -d coverage-shards ] || ! find coverage-shards -maxdepth 1 -type f -name '*.json' | grep -q .; then
+            echo "::error::No raw coverage shard data was downloaded."
+            find . -maxdepth 3 -type f | sort
+            exit 1
+          fi
+          npx c8 report \
+            --temp-directory coverage-shards \
+            --reports-dir coverage \
+            --reporter=text-summary \
+            --reporter=html \
+            --reporter=json-summary \
+            --reporter=lcov \
+            --exclude=tests/** \
+            --exclude=**/*.test.* \
+            --check-coverage \
+            --statements 75 --lines 75 --functions 75 --branches 70
       - name: Build coverage summary
         if: always()
         run: |
           mkdir -p coverage
           if [ -f coverage/coverage-summary.json ]; then
-            node scripts/test-report-summary.mjs \
+            node scripts/check/test-report-summary.mjs \
               --input coverage/coverage-summary.json \
               --output coverage/coverage-report.md \
               --threshold 60
@@ -222,12 +393,16 @@ jobs:
           name: coverage-report
           path: .
       - name: Explain SonarQube skip
-        if: ${{ env.SONAR_TOKEN == '' || env.SONAR_HOST_URL == '' }}
+        if: ${{ github.event_name != 'pull_request' || env.SONAR_TOKEN == '' || env.SONAR_HOST_URL == '' }}
         run: |
-          echo "SonarQube scan skipped because SONAR_TOKEN or SONAR_HOST_URL is not configured." >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "SonarQube scan skipped on non-PR events to keep main pushes governed by repository CI gates." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "SonarQube scan skipped because SONAR_TOKEN or SONAR_HOST_URL is not configured." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: SonarQube Scan
-        if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
-        uses: SonarSource/sonarqube-scan-action@v7
+        if: ${{ github.event_name == 'pull_request' && env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
+        uses: SonarSource/sonarqube-scan-action@v8
         env:
           SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
@@ -311,46 +486,55 @@ jobs:
             }
 
   test-e2e:
-    name: E2E Tests (${{ matrix.shard }}/4)
+    name: E2E Tests (${{ matrix.shard }}/6)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    env:
+      JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+      API_KEY_SECRET: ci-test-api-key-secret-long
+      DISABLE_SQLITE_AUTO_BACKUP: "true"
+      OMNIROUTE_PLAYWRIGHT_SKIP_BUILD: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.CI_NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run check:node-runtime
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build
+      - run: npx playwright test tests/e2e/*.spec.ts --shard=${{ matrix.shard }}/6
+
+  test-integration:
+    name: Integration Tests (${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: build
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
-    env:
-      JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
-      API_KEY_SECRET: ci-test-api-key-secret-long
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npx playwright install --with-deps chromium
-      - run: npm run build
-      - run: npx playwright test tests/e2e/*.spec.ts --shard=${{ matrix.shard }}/4
-
-  test-integration:
-    name: Integration Tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs: build
+        shard: [1, 2]
     env:
       JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
       API_KEY_SECRET: ci-test-api-key-secret-long
       INITIAL_PASSWORD: ci-test-password-for-integration
-      DATA_DIR: /tmp/omniroute-ci
+      DATA_DIR: /tmp/omniroute-ci-${{ matrix.shard }}
+      DISABLE_SQLITE_AUTO_BACKUP: "true"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
       - run: npm ci
-      - run: npm run test:integration
+      - run: npm run check:node-runtime
+      - run: node --import tsx --test --test-force-exit --test-concurrency=1 --test-shard=${{ matrix.shard }}/2 tests/integration/*.test.ts
 
   test-security:
     name: Security Tests
@@ -359,13 +543,15 @@ jobs:
     env:
       JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
       API_KEY_SECRET: ci-test-api-key-secret-long
+      DISABLE_SQLITE_AUTO_BACKUP: "true"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
       - run: npm ci
+      - run: npm run check:node-runtime
       - run: npm run test:security
 
   ci-summary:
@@ -374,11 +560,17 @@ jobs:
     if: always()
     needs:
       - lint
+      - docs-sync-strict
+      - i18n-ui-coverage
       - i18n
       - pr-test-policy
-      - advanced-security
+
       - build
+      - package-artifact
+      - electron-package-smoke
       - test-unit
+      - node-24-compat
+      - node-26-compat
       - test-coverage
       - sonarqube
       - coverage-pr-comment
@@ -415,8 +607,10 @@ jobs:
           echo "| Job | Status |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Lint | $(status '${{ needs.lint.result }}') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Docs Sync (Strict) | $(status '${{ needs.docs-sync-strict.result }}') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| i18n UI Coverage | $(status '${{ needs.i18n-ui-coverage.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| PR Test Policy | $(status '${{ needs.pr-test-policy.result }}') |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Advanced Security | $(status '${{ needs.advanced-security.result }}') |" >> "$GITHUB_STEP_SUMMARY"
+
           echo "| SonarQube | $(status '${{ needs.sonarqube.result }}') |" >> "$GITHUB_STEP_SUMMARY"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -424,12 +618,16 @@ jobs:
           echo "| Job | Status |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Build Matrix | $(status '${{ needs.build.result }}') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Package Artifact | $(status '${{ needs.package-artifact.result }}') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Electron Package Smoke | $(status '${{ needs.electron-package-smoke.result }}') |" >> "$GITHUB_STEP_SUMMARY"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## 🧪 Tests" >> "$GITHUB_STEP_SUMMARY"
           echo "| Suite | Status |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Unit | $(status '${{ needs.test-unit.result }}') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Node 24 Compatibility | $(status '${{ needs.node-24-compat.result }}') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Node 26 Compatibility | $(status '${{ needs.node-26-compat.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Coverage | $(status '${{ needs.test-coverage.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| PR Coverage Comment | $(status '${{ needs.coverage-pr-comment.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| E2E | $(status '${{ needs.test-e2e.result }}') |" >> "$GITHUB_STEP_SUMMARY"

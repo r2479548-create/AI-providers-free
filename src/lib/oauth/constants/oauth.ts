@@ -1,15 +1,40 @@
+import {
+  ANTIGRAVITY_BASE_URLS,
+  getAntigravityFetchAvailableModelsUrls,
+} from "@omniroute/open-sse/config/antigravityUpstream.ts";
+import {
+  ANTIGRAVITY_LOAD_CODE_ASSIST_API_CLIENT,
+  ANTIGRAVITY_LOAD_CODE_ASSIST_USER_AGENT,
+  getAntigravityLoadCodeAssistClientMetadata,
+} from "@omniroute/open-sse/services/antigravityHeaders.ts";
+import {
+  GITHUB_COPILOT_API_VERSION,
+  GITHUB_COPILOT_CHAT_PLUGIN_VERSION,
+  GITHUB_COPILOT_CHAT_USER_AGENT,
+  GITHUB_COPILOT_EDITOR_VERSION,
+} from "@omniroute/open-sse/config/providerHeaderProfiles.ts";
+import {
+  resolvePublicCred,
+  resolvePublicCredMulti,
+} from "@omniroute/open-sse/utils/publicCreds.ts";
+import { buildGitLabOAuthEndpoints, GITLAB_DUO_DEFAULT_BASE_URL } from "../gitlab";
+
 /**
  * OAuth Configuration Constants
  *
  * All credentials are read exclusively from environment variables.
- * Default values are provided via .env.example and auto-populated by
- * scripts/sync-env.mjs on install. See .env.example for the built-in
- * credentials used for localhost setups.
+ * Default values match the public CLI client IDs from .env.example
+ * (auto-populated by scripts/dev/sync-env.mjs on install).
+ *
+ * These are public OAuth client credentials for desktop/CLI applications
+ * that rely on PKCE for security (RFC 8252), not on secret confidentiality.
+ * Shared header/version fingerprints now come from the central provider
+ * header profile module so OAuth, usage fetchers and executors stay aligned.
  */
 
 // Claude OAuth Configuration (Authorization Code Flow with PKCE)
 export const CLAUDE_CONFIG = {
-  clientId: process.env.CLAUDE_OAUTH_CLIENT_ID || "",
+  clientId: process.env.CLAUDE_OAUTH_CLIENT_ID || "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
   authorizeUrl: "https://claude.ai/oauth/authorize",
   tokenUrl: "https://console.anthropic.com/v1/oauth/token",
   redirectUri:
@@ -26,7 +51,7 @@ export const CLAUDE_CONFIG = {
 
 // Codex (OpenAI) OAuth Configuration (Authorization Code Flow with PKCE)
 export const CODEX_CONFIG = {
-  clientId: process.env.CODEX_OAUTH_CLIENT_ID || "",
+  clientId: process.env.CODEX_OAUTH_CLIENT_ID || "app_EMoamEEZ73f0CkXaXp7hrann",
   authorizeUrl: "https://auth.openai.com/oauth/authorize",
   tokenUrl: "https://auth.openai.com/oauth/token",
   scope: "openid profile email offline_access",
@@ -36,14 +61,31 @@ export const CODEX_CONFIG = {
     id_token_add_organizations: "true",
     codex_cli_simplified_flow: "true",
     originator: "codex_cli_rs",
+    // prompt=login forces Auth0/OpenAI to RE-AUTHENTICATE the user instead of
+    // silently reusing an existing browser session. This is THE KEY parameter
+    // that enables multi-account OAuth on the same device + same client_id:
+    // without it, OAuth flow #2 carries over session state from OAuth flow #1
+    // and Auth0 invalidates the previous account's refresh_token family as a
+    // "session takeover". With prompt=login, each OAuth flow creates an
+    // isolated session that does not trample siblings.
+    // Ported from ndycode/codex-multi-auth (auth.ts: forceNewLogin option) —
+    // the only known tool that sustains multiple Codex OAuth accounts.
+    prompt: "login",
   },
 };
 
 // Gemini (Google) OAuth Configuration (Standard OAuth2)
+// clientId/clientSecret are public values shipped in the Gemini CLI binary;
+// resolved through resolvePublicCred so they don't appear as literals here.
 export const GEMINI_CONFIG = {
-  clientId: process.env.GEMINI_CLI_OAUTH_CLIENT_ID || process.env.GEMINI_OAUTH_CLIENT_ID || "",
-  clientSecret:
-    process.env.GEMINI_CLI_OAUTH_CLIENT_SECRET || process.env.GEMINI_OAUTH_CLIENT_SECRET || "",
+  clientId: resolvePublicCredMulti("gemini_id", [
+    "GEMINI_CLI_OAUTH_CLIENT_ID",
+    "GEMINI_OAUTH_CLIENT_ID",
+  ]),
+  clientSecret: resolvePublicCredMulti("gemini_alt", [
+    "GEMINI_CLI_OAUTH_CLIENT_SECRET",
+    "GEMINI_OAUTH_CLIENT_SECRET",
+  ]),
   authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
   tokenUrl: "https://oauth2.googleapis.com/token",
   userInfoUrl: "https://www.googleapis.com/oauth2/v1/userinfo",
@@ -56,7 +98,7 @@ export const GEMINI_CONFIG = {
 
 // Qwen OAuth Configuration (Device Code Flow with PKCE)
 export const QWEN_CONFIG = {
-  clientId: process.env.QWEN_OAUTH_CLIENT_ID || "",
+  clientId: process.env.QWEN_OAUTH_CLIENT_ID || "f0304373b74a44d2b584a3fb70ca9e56",
   deviceCodeUrl: "https://chat.qwen.ai/api/v1/oauth2/device/code",
   tokenUrl: "https://chat.qwen.ai/api/v1/oauth2/token",
   scope: "openid profile email model.completion",
@@ -91,7 +133,7 @@ export const QODER_CONFIG = {
 
 // Kimi Coding OAuth Configuration (Device Code Flow)
 export const KIMI_CODING_CONFIG = {
-  clientId: process.env.KIMI_CODING_OAUTH_CLIENT_ID || "",
+  clientId: process.env.KIMI_CODING_OAUTH_CLIENT_ID || "17e5f671-d194-4dfb-9706-5516cb48c098",
   deviceCodeUrl: "https://auth.kimi.com/api/oauth/device_authorization",
   tokenUrl: "https://auth.kimi.com/api/oauth/token",
 };
@@ -113,13 +155,16 @@ export const CLINE_CONFIG = {
 };
 
 // Antigravity OAuth Configuration (Standard OAuth2 with Google)
+// clientId/clientSecret are public values shipped in the Antigravity CLI;
+// resolved through resolvePublicCred so they don't appear as literals here.
 export const ANTIGRAVITY_CONFIG = {
-  clientId: process.env.ANTIGRAVITY_OAUTH_CLIENT_ID || "",
-  clientSecret: process.env.ANTIGRAVITY_OAUTH_CLIENT_SECRET || "",
+  clientId: resolvePublicCred("antigravity_id", "ANTIGRAVITY_OAUTH_CLIENT_ID"),
+  clientSecret: resolvePublicCred("antigravity_alt", "ANTIGRAVITY_OAUTH_CLIENT_SECRET"),
   authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
   tokenUrl: "https://oauth2.googleapis.com/token",
   userInfoUrl: "https://www.googleapis.com/oauth2/v1/userinfo",
   scopes: [
+    "openid",
     "https://www.googleapis.com/auth/cloud-platform",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
@@ -127,20 +172,28 @@ export const ANTIGRAVITY_CONFIG = {
     "https://www.googleapis.com/auth/experimentsandconfigs",
   ],
   // Antigravity specific
-  apiEndpoint: "https://cloudcode-pa.googleapis.com",
+  apiEndpoint: ANTIGRAVITY_BASE_URLS[0],
   apiVersion: "v1internal",
-  loadCodeAssistEndpoint: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
-  onboardUserEndpoint: "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
-  fetchAvailableModelsEndpoint:
-    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-  loadCodeAssistUserAgent: "google-api-nodejs-client/9.15.1",
-  loadCodeAssistApiClient: "google-cloud-sdk vscode_cloudshelleditor/0.1",
-  loadCodeAssistClientMetadata: `{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`,
+  loadCodeAssistEndpoints: ANTIGRAVITY_BASE_URLS.map(
+    (baseUrl) => `${baseUrl}/v1internal:loadCodeAssist`
+  ),
+  onboardUserEndpoints: ANTIGRAVITY_BASE_URLS.map((baseUrl) => `${baseUrl}/v1internal:onboardUser`),
+  fetchAvailableModelsEndpoints: getAntigravityFetchAvailableModelsUrls(),
+  loadCodeAssistEndpoint: `${ANTIGRAVITY_BASE_URLS[0]}/v1internal:loadCodeAssist`,
+  onboardUserEndpoint: `${ANTIGRAVITY_BASE_URLS[0]}/v1internal:onboardUser`,
+  fetchAvailableModelsEndpoint: getAntigravityFetchAvailableModelsUrls()[0],
+  loadCodeAssistUserAgent: ANTIGRAVITY_LOAD_CODE_ASSIST_USER_AGENT,
+  loadCodeAssistApiClient: ANTIGRAVITY_LOAD_CODE_ASSIST_API_CLIENT,
+  loadCodeAssistClientMetadata: getAntigravityLoadCodeAssistClientMetadata(),
 };
 
 // OpenAI OAuth Configuration (Authorization Code Flow with PKCE)
+// Re-uses CODEX_CONFIG.clientId to avoid duplication — same provider, different originator.
+// IMPORTANT: same Auth0 backend as Codex → same multi-account session-takeover
+// risk. `prompt: "login"` is mandatory to allow multiple OpenAI Native accounts
+// on the same device. See CODEX_CONFIG above for the full explanation.
 export const OPENAI_CONFIG = {
-  clientId: process.env.CODEX_OAUTH_CLIENT_ID || "",
+  clientId: CODEX_CONFIG.clientId,
   authorizeUrl: "https://auth.openai.com/oauth/authorize",
   tokenUrl: "https://auth.openai.com/oauth/token",
   scope: "openid profile email offline_access",
@@ -148,21 +201,37 @@ export const OPENAI_CONFIG = {
   extraParams: {
     id_token_add_organizations: "true",
     originator: "openai_native",
+    prompt: "login",
   },
 };
 
 // GitHub Copilot OAuth Configuration (Device Code Flow)
 export const GITHUB_CONFIG = {
-  clientId: process.env.GITHUB_OAUTH_CLIENT_ID || "",
+  clientId: process.env.GITHUB_OAUTH_CLIENT_ID || "Iv1.b507a08c87ecfe98",
   deviceCodeUrl: "https://github.com/login/device/code",
   tokenUrl: "https://github.com/login/oauth/access_token",
   userInfoUrl: "https://api.github.com/user",
   scopes: "read:user",
-  apiVersion: "2022-11-28", // Updated to supported version
+  apiVersion: GITHUB_COPILOT_API_VERSION,
   copilotTokenUrl: "https://api.github.com/copilot_internal/v2/token",
-  userAgent: "GitHubCopilotChat/0.26.7",
-  editorVersion: "vscode/1.85.0",
-  editorPluginVersion: "copilot-chat/0.26.7",
+  userAgent: GITHUB_COPILOT_CHAT_USER_AGENT,
+  editorVersion: GITHUB_COPILOT_EDITOR_VERSION,
+  editorPluginVersion: GITHUB_COPILOT_CHAT_PLUGIN_VERSION,
+};
+
+const GITLAB_DUO_ENDPOINTS = buildGitLabOAuthEndpoints(GITLAB_DUO_DEFAULT_BASE_URL);
+
+export const GITLAB_DUO_CONFIG = {
+  baseUrl: GITLAB_DUO_ENDPOINTS.root,
+  clientId: process.env.GITLAB_DUO_OAUTH_CLIENT_ID || process.env.GITLAB_OAUTH_CLIENT_ID || "",
+  clientSecret:
+    process.env.GITLAB_DUO_OAUTH_CLIENT_SECRET || process.env.GITLAB_OAUTH_CLIENT_SECRET || "",
+  authorizeUrl: GITLAB_DUO_ENDPOINTS.authorizeUrl,
+  tokenUrl: GITLAB_DUO_ENDPOINTS.tokenUrl,
+  userInfoUrl: GITLAB_DUO_ENDPOINTS.userUrl,
+  directAccessUrl: GITLAB_DUO_ENDPOINTS.directAccessUrl,
+  scope: "ai_features read_user",
+  codeChallengeMethod: "S256",
 };
 
 // Kiro OAuth Configuration
@@ -190,6 +259,15 @@ export const KIRO_CONFIG = {
   socialLoginUrl: "https://prod.us-east-1.auth.desktop.kiro.dev/login",
   socialTokenUrl: "https://prod.us-east-1.auth.desktop.kiro.dev/oauth/token",
   socialRefreshUrl: "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken",
+  // Social device-code flow (Google/GitHub).
+  // `socialClientId` is a public CLI identifier — Kiro's device endpoint accepts
+  // any non-empty string and behaves like a User-Agent rather than a secret.
+  // The env override exists so operators on locked-down builds can pin a
+  // custom value if AWS ever starts enforcing this field (Hard Rule #11 spirit).
+  socialClientId: process.env.KIRO_OAUTH_CLIENT_ID || "kiro-cli",
+  socialDeviceAuthorizeUrl:
+    "https://prod.us-east-1.auth.desktop.kiro.dev/oauth/device/authorization",
+  socialDevicePollUrl: "https://prod.us-east-1.auth.desktop.kiro.dev/oauth/device/poll",
   // Auth methods
   authMethods: ["builder-id", "idc", "google", "github", "import"],
 };
@@ -207,7 +285,7 @@ export const CURSOR_CONFIG = {
   agentEndpoint: "https://agent.api5.cursor.sh", // Privacy mode
   agentNonPrivacyEndpoint: "https://agentn.api5.cursor.sh", // Non-privacy mode
   // Client metadata
-  clientVersion: "3.1.0",
+  clientVersion: "3.2.14",
   clientType: "ide",
   // Token storage locations (for user reference)
   tokenStoragePaths: {
@@ -220,6 +298,70 @@ export const CURSOR_CONFIG = {
     accessToken: "cursorAuth/accessToken",
     machineId: "storage.serviceMachineId",
   },
+};
+
+// Trae IDE Configuration (#2658)
+//
+// Trae is an AI-native IDE by ByteDance. Authentication is currently imported
+// token only — users sign in inside Trae and paste the resulting API token
+// here. ByteDance has not published a public OAuth client_id/secret or a CLI
+// with extractable credentials, so no automated discovery is possible yet.
+// If ByteDance ever publishes a public device-code or PKCE flow, swap
+// flowType in src/lib/oauth/providers/trae.ts and wire endpoints below.
+export const TRAE_CONFIG = {
+  apiEndpoint: "https://api.trae.ai",
+  clientType: "ide",
+  tokenStoragePaths: {
+    linux: "~/.config/Trae/User/globalStorage/state.vscdb",
+    macos: "/Users/<user>/Library/Application Support/Trae/User/globalStorage/state.vscdb",
+    windows: "%APPDATA%\\Trae\\User\\globalStorage\\state.vscdb",
+  },
+  // Chat completions path (mirrored from OpenAI-compatible providers)
+  chatEndpoint: "/v1/chat/completions",
+  // Trae website — users retrieve their token here after signing in
+  webUrl: "https://trae.ai",
+  // Token storage note for users — no automated extraction path is available
+  // because Trae does not expose a public SQLite / keychain location yet.
+  tokenNote: "Sign in to Trae IDE, then copy your API token from the account settings.",
+};
+
+// Windsurf / Devin CLI Configuration
+//
+// Authentication uses PKCE Authorization Code Flow — same pattern as Codex CLI.
+// Extracted from Devin CLI binary (model_configs_v2.bin + devin.exe strings):
+//
+//   Authorize URL:  https://app.devin.ai/editor/signin
+//   Params:         response_type=code, redirect_uri, code_challenge, code_challenge_method=S256
+//   Callback path:  /auth/callback  (local server on random port 127.0.0.1:0)
+//   Exchange:       POST https://server.codeium.com/<ExchangePKCEAuthorizationCode>
+//                   via Connect JSON protocol (Content-Type: application/json)
+//   Response field: windsurfApiKey  → stored as accessToken / WINDSURF_API_KEY
+//
+// Fallback: user can also paste a token from windsurf.com/show-auth-token
+export const WINDSURF_CONFIG = {
+  // Browser-based PKCE authorize endpoint (extracted from devin.exe binary)
+  authorizeUrl: "https://app.devin.ai/editor/signin",
+  codeChallengeMethod: "S256" as const,
+  // Local callback server — 0 = OS assigns a free port
+  callbackPort: 0,
+  callbackPath: "/auth/callback",
+  // Token exchange via Windsurf Connect JSON (gRPC-web + JSON)
+  apiServerUrl: "https://server.codeium.com",
+  exchangePath: "/exa.seat_management_pb.SeatManagementService/ExchangePKCEAuthorizationCode",
+  // Inference server URL (gRPC-web requests go here)
+  inferenceUrl: "https://server.self-serve.windsurf.com",
+  // Fallback: user visits this page, copies token, pastes it
+  showAuthTokenUrl: "https://windsurf.com/show-auth-token",
+  // Token refresh via Firebase Secure Token Service (for short-lived browser-flow tokens).
+  // Default is the public Firebase Web client identifier embedded in the
+  // Windsurf/Devin CLI binary; users may override via WINDSURF_FIREBASE_API_KEY.
+  // Long-lived import tokens never need this — refresh is skipped when key is absent.
+  firebaseApiKey: resolvePublicCred("windsurf_fb", "WINDSURF_FIREBASE_API_KEY"),
+  firebaseTokenUrl: "https://securetoken.googleapis.com/v1/token",
+  // IDE identity sent with every gRPC request
+  ideName: "windsurf",
+  ideVersion: "3.14.0",
+  extensionVersion: "3.14.0",
 };
 
 // OAuth timeout (5 minutes)
@@ -236,8 +378,13 @@ export const PROVIDERS = {
   KIMI_CODING: "kimi-coding",
   OPENAI: "openai",
   GITHUB: "github",
+  GITLAB_DUO: "gitlab-duo",
   KIRO: "kiro",
+  AMAZON_Q: "amazon-q",
   CURSOR: "cursor",
   KILOCODE: "kilocode",
   CLINE: "cline",
+  WINDSURF: "windsurf",
+  DEVIN_CLI: "devin-cli",
+  TRAE: "trae",
 };

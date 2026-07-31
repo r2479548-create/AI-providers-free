@@ -22,9 +22,19 @@ function readSSEEvents(rawSSE) {
     }
 
     try {
+      const data = JSON.parse(payload);
+      if (
+        currentEvent &&
+        data &&
+        typeof data === "object" &&
+        !Array.isArray(data) &&
+        typeof data.type !== "string"
+      ) {
+        data.type = currentEvent;
+      }
       events.push({
         event: currentEvent || undefined,
-        data: JSON.parse(payload),
+        data,
       });
     } catch {
       // Ignore malformed SSE events and continue best-effort parsing.
@@ -41,12 +51,21 @@ function readSSEEvents(rawSSE) {
     }
 
     if (line.startsWith("event:")) {
+      // Some relays omit the blank separator between Claude events. Flush the
+      // previous event before accepting the next event name.
+      if (currentData.length > 0) flush();
       currentEvent = line.slice(6).trim();
       continue;
     }
 
     if (line.startsWith("data:")) {
-      currentData.push(line.slice(5).trimStart());
+      const dataLine = line.slice(5).trimStart();
+      if (dataLine.trim() === "[DONE]") {
+        flush();
+        currentEvent = "";
+        continue;
+      }
+      currentData.push(dataLine);
     }
   }
 
@@ -74,6 +93,7 @@ function toNumber(value, fallback = 0) {
 export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
   const lines = String(rawSSE || "").split("\n");
   const chunks = [];
+  let sawChoices = false;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -81,13 +101,17 @@ export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
     const payload = trimmed.slice(5).trim();
     if (!payload || payload === "[DONE]") continue;
     try {
-      chunks.push(JSON.parse(payload));
+      const parsed = JSON.parse(payload);
+      if (Array.isArray(parsed?.choices)) {
+        sawChoices = true;
+      }
+      chunks.push(parsed);
     } catch {
       // Ignore malformed SSE lines and continue best-effort parsing.
     }
   }
 
-  if (chunks.length === 0) return null;
+  if (chunks.length === 0 || !sawChoices) return null;
 
   const first = chunks[0];
   const contentParts = [];
@@ -230,6 +254,7 @@ export function parseSSEToClaudeResponse(rawSSE, fallbackModel) {
   let role = "assistant";
   let stopReason = "end_turn";
   let stopSequence = null;
+  let sawClaudeEvent = false;
 
   const mergeUsage = (incoming) => {
     const usageRecord = toRecord(incoming);
@@ -255,6 +280,7 @@ export function parseSSEToClaudeResponse(rawSSE, fallbackModel) {
   for (const payload of payloads) {
     const eventType = toString(payload.type);
     if (eventType === "message_start") {
+      sawClaudeEvent = true;
       const message = toRecord(payload.message);
       messageId = toString(message.id, messageId || `msg_${Date.now()}`);
       model = toString(message.model, model);
@@ -264,6 +290,7 @@ export function parseSSEToClaudeResponse(rawSSE, fallbackModel) {
     }
 
     if (eventType === "content_block_start") {
+      sawClaudeEvent = true;
       const index = toNumber(payload.index, blocks.size);
       const contentBlock = toRecord(payload.content_block);
       const blockType = toString(contentBlock.type);
@@ -296,6 +323,7 @@ export function parseSSEToClaudeResponse(rawSSE, fallbackModel) {
     }
 
     if (eventType === "content_block_delta") {
+      sawClaudeEvent = true;
       const index = toNumber(payload.index, 0);
       const delta = toRecord(payload.delta);
       const deltaType = toString(delta.type);
@@ -342,6 +370,7 @@ export function parseSSEToClaudeResponse(rawSSE, fallbackModel) {
     }
 
     if (eventType === "message_delta") {
+      sawClaudeEvent = true;
       const delta = toRecord(payload.delta);
       stopReason = toString(delta.stop_reason, stopReason);
       stopSequence =
@@ -352,6 +381,8 @@ export function parseSSEToClaudeResponse(rawSSE, fallbackModel) {
 
     mergeUsage(payload.usage);
   }
+
+  if (!sawClaudeEvent) return null;
 
   const content = [...blocks.values()]
     .sort((a, b) => a.index - b.index)

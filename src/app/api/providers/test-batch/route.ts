@@ -1,20 +1,35 @@
 import { NextResponse } from "next/server";
 import { getProviderConnections } from "@/models";
 import {
-  FREE_PROVIDERS,
+  AI_PROVIDERS,
+  NOAUTH_PROVIDERS,
   OAUTH_PROVIDERS,
   APIKEY_PROVIDERS,
+  LOCAL_PROVIDERS,
+  UPSTREAM_PROXY_PROVIDERS,
+  WEB_COOKIE_PROVIDERS,
+  SEARCH_PROVIDERS,
+  AUDIO_ONLY_PROVIDERS,
+  CLOUD_AGENT_PROVIDERS,
+  IDE_PROVIDER_IDS,
   OPENAI_COMPATIBLE_PREFIX,
   ANTHROPIC_COMPATIBLE_PREFIX,
 } from "@/shared/constants/providers";
 import { testSingleConnection } from "../[id]/test/route";
 import { providersBatchTestSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
 // Determine auth type group for a provider id
 function getAuthGroup(providerId) {
-  if (FREE_PROVIDERS[providerId]) return "free";
+  if (NOAUTH_PROVIDERS[providerId]) return "no-auth";
   if (OAUTH_PROVIDERS[providerId]) return "oauth";
+  if (WEB_COOKIE_PROVIDERS[providerId]) return "web-cookie";
+  if (SEARCH_PROVIDERS[providerId]) return "search";
+  if (AUDIO_ONLY_PROVIDERS[providerId]) return "audio";
+  if (LOCAL_PROVIDERS[providerId]) return "local";
+  if (UPSTREAM_PROXY_PROVIDERS[providerId]) return "upstream-proxy";
+  if (CLOUD_AGENT_PROVIDERS[providerId]) return "cloud-agent";
   if (APIKEY_PROVIDERS[providerId]) return "apikey";
   if (
     typeof providerId === "string" &&
@@ -22,7 +37,11 @@ function getAuthGroup(providerId) {
       providerId.startsWith(ANTHROPIC_COMPATIBLE_PREFIX))
   )
     return "compatible";
-  return "apikey";
+  return "unknown";
+}
+
+function providerHasFreeTier(providerId) {
+  return AI_PROVIDERS[providerId]?.hasFree === true;
 }
 
 function isCompatibleProvider(providerId) {
@@ -35,6 +54,9 @@ function isCompatibleProvider(providerId) {
 
 // POST /api/providers/test-batch - Test multiple connections by group
 export async function POST(request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();
@@ -67,19 +89,40 @@ export async function POST(request) {
     } else if (mode === "oauth") {
       connectionsToTest = allConnections.filter((c) => {
         const authGroup = getAuthGroup(c.provider);
-        return authGroup === "oauth" || authGroup === "free";
+        return authGroup === "oauth";
       });
     } else if (mode === "free") {
-      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "free");
+      connectionsToTest = allConnections.filter((c) => providerHasFreeTier(c.provider));
+    } else if (mode === "no-auth") {
+      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "no-auth");
     } else if (mode === "apikey") {
       connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "apikey");
+    } else if (mode === "web-cookie") {
+      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "web-cookie");
+    } else if (mode === "search") {
+      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "search");
+    } else if (mode === "audio") {
+      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "audio");
+    } else if (mode === "local") {
+      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "local");
+    } else if (mode === "upstream-proxy") {
+      connectionsToTest = allConnections.filter(
+        (c) => getAuthGroup(c.provider) === "upstream-proxy"
+      );
+    } else if (mode === "cloud-agent") {
+      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "cloud-agent");
+    } else if (mode === "ide") {
+      connectionsToTest = allConnections.filter((c) => IDE_PROVIDER_IDS.has(c.provider));
     } else if (mode === "compatible") {
       connectionsToTest = allConnections.filter((c) => isCompatibleProvider(c.provider));
     } else if (mode === "all") {
       connectionsToTest = allConnections;
     } else {
       return NextResponse.json(
-        { error: "Invalid mode. Use: provider, oauth, free, apikey, compatible, all" },
+        {
+          error:
+            "Invalid mode. Use: provider, oauth, free, no-auth, apikey, compatible, all, web-cookie, search, audio, local, upstream-proxy, cloud-agent, ide",
+        },
         { status: 400 }
       );
     }
@@ -97,7 +140,7 @@ export async function POST(request) {
     const PER_CONNECTION_TIMEOUT = 30_000; // 30s per connection
     const CONCURRENCY = 5; // max parallel tests
 
-    const testOne = async (conn) => {
+    const testOne = async (conn: Record<string, unknown>) => {
       try {
         const result = await Promise.race([
           testSingleConnection(conn.id),
@@ -108,7 +151,14 @@ export async function POST(request) {
             )
           ),
         ]);
-        const data = result as any;
+        const data = result as {
+          valid: boolean;
+          latencyMs?: number;
+          error?: string | null;
+          diagnosis?: unknown;
+          statusCode?: number | null;
+          testedAt?: string;
+        };
         return {
           provider: conn.provider,
           connectionId: conn.id,

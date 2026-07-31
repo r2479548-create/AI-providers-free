@@ -1,46 +1,29 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useTranslations } from "next-intl";
 import Card from "./Card";
 import RequestLoggerDetail from "./RequestLoggerDetail";
 import { copyToClipboard } from "@/shared/utils/clipboard";
 import {
-  PROTOCOL_COLORS,
   PROVIDER_COLORS,
   getHttpStatusStyle as getStatusStyle,
+  getProtocolColor,
 } from "@/shared/constants/colors";
 import {
   formatTime,
   formatDuration,
   maskSegment,
   maskAccount,
+  stableAccountSuffix,
   formatApiKeyLabel,
 } from "@/shared/utils/formatting";
+import useEmailPrivacyStore from "@/store/emailPrivacyStore";
 
-// Quick filter categories - status-based only (providers are dynamic from data)
-const STATUS_FILTERS = [
-  { key: "all", label: "All" },
-  { key: "error", label: "Errors", icon: "error" },
-  { key: "ok", label: "Success", icon: "check_circle" },
-  { key: "combo", label: "Combo", icon: "hub" },
-];
-
-// Column definitions for visibility toggles
-const COLUMNS = [
-  { key: "status", label: "Status" },
-  { key: "model", label: "Model" },
-  { key: "requestedModel", label: "Requested" },
-  { key: "provider", label: "Provider" },
-  { key: "protocol", label: "Req Protocol" },
-  { key: "account", label: "Account" },
-  { key: "apiKey", label: "API Key" },
-  { key: "combo", label: "Combo" },
-  { key: "tokens", label: "Tokens" },
-  { key: "duration", label: "Duration" },
-  { key: "time", label: "Time" },
-];
-
-const DEFAULT_VISIBLE = Object.fromEntries(COLUMNS.map((c) => [c.key, true]));
+// Number of call-log rows fetched per page. The viewer grows its window by this
+// amount on "Load more" / infinite scroll so users can browse past the first
+// page (previously hardcoded to a single 300-row window). See #2565.
+const PAGE_SIZE = 300;
 
 /**
  * Get a friendly display label for compatible providers.
@@ -79,7 +62,69 @@ function getLogTotalTokens(log) {
   return (log?.tokens?.in || 0) + (log?.tokens?.out || 0);
 }
 
+function getLogTps(log): number {
+  const tokensOut = log?.tokens?.out || 0;
+  const durationMs = log?.duration || 0;
+  if (tokensOut <= 0 || durationMs <= 0) return 0;
+  return tokensOut / (durationMs / 1000);
+}
+
+function formatTps(tps: number): string {
+  if (tps <= 0) return "—";
+  if (tps >= 100) return Math.round(tps).toLocaleString();
+  return tps.toFixed(1);
+}
+
+function getCacheSourceMeta(cacheSource: unknown) {
+  if (cacheSource === "semantic") {
+    return {
+      key: "semantic",
+      className:
+        "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30",
+    };
+  }
+
+  return {
+    key: "upstream",
+    className: "bg-sky-500/15 text-sky-700 dark:text-sky-300 border border-sky-500/30",
+  };
+}
+
 export default function RequestLoggerV2() {
+  const t = useTranslations("requestLogger");
+  const { emailsVisible } = useEmailPrivacyStore();
+
+  // Get translated status filters
+  const statusFilters = useMemo(
+    () => [
+      { key: "all", label: t("statusFilters.all"), icon: "" },
+      { key: "error", label: t("statusFilters.error"), icon: "error" },
+      { key: "ok", label: t("statusFilters.success"), icon: "check_circle" },
+      { key: "combo", label: t("statusFilters.combo"), icon: "hub" },
+    ],
+    [t]
+  );
+
+  // Get translated columns
+  const columns = useMemo(
+    () => [
+      { key: "status", label: t("columns.status") },
+      { key: "cacheSource", label: t("columns.cacheSource") },
+      { key: "model", label: t("columns.model") },
+      { key: "requestedModel", label: t("columns.requested") },
+      { key: "provider", label: t("columns.provider") },
+      { key: "protocol", label: t("columns.protocol") },
+      { key: "account", label: t("columns.account") },
+      { key: "apiKey", label: t("columns.apiKey") },
+      { key: "combo", label: t("columns.combo") },
+      { key: "tokens", label: t("columns.tokens") },
+      { key: "tps", label: t("columns.tps") },
+      { key: "duration", label: t("columns.duration") },
+      { key: "time", label: t("columns.time") },
+    ],
+    [t]
+  );
+
   const [logs, setLogs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [recording, setRecording] = useState(true);
@@ -95,18 +140,24 @@ export default function RequestLoggerV2() {
   const [detailData, setDetailData] = useState(null);
   const [detailLoggingEnabled, setDetailLoggingEnabled] = useState(false);
   const [detailLoggingLoading, setDetailLoggingLoading] = useState(false);
+  const [limit, setLimit] = useState(PAGE_SIZE);
+  const [hasMore, setHasMore] = useState(false);
   const intervalRef = useRef(null);
   const hasLoadedRef = useRef(false);
+  const logsSignatureRef = useRef("");
+  const scrollContainerRef = useRef(null);
+  const loadMoreSentinelRef = useRef(null);
   const [providerNodes, setProviderNodes] = useState([]);
 
   // Column visibility with localStorage persistence
   const [visibleColumns, setVisibleColumns] = useState(() => {
-    if (typeof window === "undefined") return DEFAULT_VISIBLE;
+    const defaultVisible = Object.fromEntries(columns.map((c) => [c.key, true]));
+    if (typeof window === "undefined") return defaultVisible;
     try {
       const saved = localStorage.getItem("loggerVisibleColumns");
-      return saved ? { ...DEFAULT_VISIBLE, ...JSON.parse(saved) } : DEFAULT_VISIBLE;
+      return saved ? { ...defaultVisible, ...JSON.parse(saved) } : defaultVisible;
     } catch {
-      return DEFAULT_VISIBLE;
+      return defaultVisible;
     }
   });
 
@@ -133,12 +184,19 @@ export default function RequestLoggerV2() {
         if (selectedProvider) params.set("provider", selectedProvider);
         if (selectedAccount) params.set("account", selectedAccount);
         if (selectedApiKey) params.set("apiKey", selectedApiKey);
-        params.set("limit", "300");
+        params.set("limit", String(limit));
 
         const res = await fetch(`/api/usage/call-logs?${params}`);
         if (res.ok) {
           const data = await res.json();
-          setLogs(data);
+          // If the server returned a full window, more rows may exist beyond it.
+          setHasMore(Array.isArray(data) && data.length >= limit);
+          // Skip re-render if data hasn't changed (#1369 GPU perf)
+          const sig = JSON.stringify(data.map?.((l: any) => l.id) ?? []);
+          if (sig !== logsSignatureRef.current) {
+            logsSignatureRef.current = sig;
+            setLogs(data);
+          }
         }
       } catch (error) {
         console.error("Failed to fetch call logs:", error);
@@ -146,7 +204,7 @@ export default function RequestLoggerV2() {
         if (showLoading) setLoading(false);
       }
     },
-    [search, activeFilter, selectedModel, selectedAccount, selectedProvider, selectedApiKey]
+    [search, activeFilter, selectedModel, selectedAccount, selectedProvider, selectedApiKey, limit]
   );
 
   useEffect(() => {
@@ -187,6 +245,32 @@ export default function RequestLoggerV2() {
     };
   }, [recording, fetchLogs]);
 
+  // Reset the window back to the first page whenever the active filters change,
+  // so switching filters doesn't keep fetching a large expanded window.
+  useEffect(() => {
+    setLimit(PAGE_SIZE);
+  }, [search, activeFilter, selectedModel, selectedAccount, selectedProvider, selectedApiKey]);
+
+  const loadMore = useCallback(() => {
+    setLimit((prev) => prev + PAGE_SIZE);
+  }, []);
+
+  // Infinite scroll: grow the window when the sentinel near the bottom of the
+  // scroll container becomes visible.
+  useEffect(() => {
+    const sentinel = loadMoreSentinelRef.current;
+    const root = scrollContainerRef.current;
+    if (!sentinel || !hasMore) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting && !loading) loadMore();
+      },
+      { root, rootMargin: "200px" }
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [hasMore, loading, loadMore]);
+
   const filteredLogs = useMemo(() => {
     if (activeFilter === "combo") return logs.filter((l) => l.comboName);
     return logs;
@@ -207,6 +291,10 @@ export default function RequestLoggerV2() {
           return (b.duration || 0) - (a.duration || 0);
         case "duration_asc":
           return (a.duration || 0) - (b.duration || 0);
+        case "tps_desc":
+          return getLogTps(b) - getLogTps(a);
+        case "tps_asc":
+          return getLogTps(a) - getLogTps(b);
         case "status_desc":
           return (b.status || 0) - (a.status || 0);
         case "status_asc":
@@ -256,7 +344,7 @@ export default function RequestLoggerV2() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: nextEnabled }),
       });
-      if (!res.ok) throw new Error("Failed to update pipeline logging");
+      if (!res.ok) throw new Error(t("updatePipelineFailed"));
       setDetailLoggingEnabled(nextEnabled);
     } catch (error) {
       console.error("Failed to toggle pipeline logging:", error);
@@ -301,7 +389,7 @@ export default function RequestLoggerV2() {
           <span
             className={`w-2 h-2 rounded-full ${recording ? "bg-red-500 animate-pulse" : "bg-text-muted"}`}
           />
-          {recording ? "Recording" : "Paused"}
+          {recording ? t("recording") : t("paused")}
         </button>
 
         <button
@@ -312,16 +400,16 @@ export default function RequestLoggerV2() {
               ? "bg-amber-500/10 border-amber-500/30 text-amber-700 dark:text-amber-300"
               : "bg-bg-subtle border-border text-text-muted"
           }`}
-          title="Capture pipeline payloads for new requests"
+          title={t("capturePipeline")}
         >
           <span
             className={`w-2 h-2 rounded-full ${detailLoggingEnabled ? "bg-amber-500" : "bg-text-muted"}`}
           />
           {detailLoggingLoading
-            ? "Updating pipeline logs..."
+            ? t("updatingPipelineLogs")
             : detailLoggingEnabled
-              ? "Pipeline Logs On"
-              : "Pipeline Logs Off"}
+              ? t("pipelineLogsOn")
+              : t("pipelineLogsOff")}
         </button>
 
         {/* Search */}
@@ -331,7 +419,7 @@ export default function RequestLoggerV2() {
           </span>
           <input
             type="text"
-            placeholder="Search model, provider, account, API key, combo..."
+            placeholder={t("searchPlaceholder")}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="w-full pl-10 pr-4 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:border-primary"
@@ -344,7 +432,7 @@ export default function RequestLoggerV2() {
           onChange={(e) => setSelectedProvider(e.target.value)}
           className="px-3 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary focus:outline-none focus:border-primary appearance-none cursor-pointer min-w-[140px]"
         >
-          <option value="">All Providers</option>
+          <option value="">{t("allProviders")}</option>
           {uniqueProviders.map((p) => {
             const compatLabel = getProviderDisplayLabel(p, providerNodes);
             const pc = PROVIDER_COLORS[p];
@@ -362,7 +450,7 @@ export default function RequestLoggerV2() {
           onChange={(e) => setSelectedModel(e.target.value)}
           className="px-3 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary focus:outline-none focus:border-primary appearance-none cursor-pointer min-w-[180px]"
         >
-          <option value="">All Models</option>
+          <option value="">{t("allModels")}</option>
           {uniqueModels.map((model) => (
             <option key={model} value={model}>
               {model}
@@ -376,10 +464,10 @@ export default function RequestLoggerV2() {
           onChange={(e) => setSelectedAccount(e.target.value)}
           className="px-3 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary focus:outline-none focus:border-primary appearance-none cursor-pointer min-w-[140px]"
         >
-          <option value="">All Accounts</option>
+          <option value="">{t("allAccounts")}</option>
           {uniqueAccounts.map((a) => (
             <option key={a} value={a}>
-              {a}
+              {emailsVisible ? a : `${maskAccount(a, false)} · #${stableAccountSuffix(a)}`}
             </option>
           ))}
         </select>
@@ -390,7 +478,7 @@ export default function RequestLoggerV2() {
           onChange={(e) => setSelectedApiKey(e.target.value)}
           className="px-3 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary focus:outline-none focus:border-primary appearance-none cursor-pointer min-w-[160px]"
         >
-          <option value="">All API Keys</option>
+          <option value="">{t("allApiKeys")}</option>
           {uniqueApiKeys.map((value) => {
             const matched = logs.find((l) => (l.apiKeyId || l.apiKeyName) === value);
             const label = formatApiKeyLabel(matched?.apiKeyName, matched?.apiKeyId);
@@ -405,28 +493,28 @@ export default function RequestLoggerV2() {
         {/* Stats */}
         <div className="flex items-center gap-2 text-xs text-text-muted">
           <span className="px-2 py-1 rounded bg-bg-subtle border border-border font-mono">
-            {totalCount} total
+            {totalCount} {t("total")}
           </span>
           <span className="px-2 py-1 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 font-mono">
-            {okCount} OK
+            {okCount} {t("ok")}
           </span>
           {errorCount > 0 && (
             <span className="px-2 py-1 rounded bg-red-500/10 text-red-700 dark:text-red-400 font-mono">
-              {errorCount} ERR
+              {errorCount} {t("err")}
             </span>
           )}
           {comboCount > 0 && (
             <span className="px-2 py-1 rounded bg-violet-500/10 text-violet-700 dark:text-violet-400 font-mono">
-              {comboCount} combo
+              {comboCount} {t("combo")}
             </span>
           )}
           {apiKeyCount > 0 && (
             <span className="px-2 py-1 rounded bg-primary/10 text-primary font-mono">
-              {apiKeyCount} keys
+              {apiKeyCount} {t("keys")}
             </span>
           )}
           <span className="px-2 py-1 rounded bg-bg-subtle border border-border font-mono">
-            {sortedLogs.length} shown
+            {sortedLogs.length} {t("shown")}
           </span>
         </div>
 
@@ -435,25 +523,25 @@ export default function RequestLoggerV2() {
           value={sortBy}
           onChange={(e) => setSortBy(e.target.value)}
           className="px-3 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary focus:outline-none focus:border-primary appearance-none cursor-pointer min-w-[150px]"
-          title="Sort logs"
+          title={t("sortLogs")}
         >
-          <option value="newest">Newest</option>
-          <option value="oldest">Oldest</option>
-          <option value="tokens_desc">Tokens ↓</option>
-          <option value="tokens_asc">Tokens ↑</option>
-          <option value="duration_desc">Duration ↓</option>
-          <option value="duration_asc">Duration ↑</option>
-          <option value="status_desc">Status ↓</option>
-          <option value="status_asc">Status ↑</option>
-          <option value="model_asc">Model A-Z</option>
-          <option value="model_desc">Model Z-A</option>
+          <option value="newest">{t("sortNewest")}</option>
+          <option value="oldest">{t("sortOldest")}</option>
+          <option value="tokens_desc">{t("sortTokensDesc")}</option>
+          <option value="tokens_asc">{t("sortTokensAsc")}</option>
+          <option value="duration_desc">{t("sortDurationDesc")}</option>
+          <option value="duration_asc">{t("sortDurationAsc")}</option>
+          <option value="status_desc">{t("sortStatusDesc")}</option>
+          <option value="status_asc">{t("sortStatusAsc")}</option>
+          <option value="model_asc">{t("sortModelAsc")}</option>
+          <option value="model_desc">{t("sortModelDesc")}</option>
         </select>
 
         {/* Refresh */}
         <button
           onClick={() => fetchLogs(false)}
           className="p-2 rounded-lg hover:bg-bg-subtle text-text-muted hover:text-text-primary transition-colors"
-          title="Refresh"
+          title={t("refresh")}
         >
           <span className="material-symbols-outlined text-[18px]">refresh</span>
         </button>
@@ -462,7 +550,7 @@ export default function RequestLoggerV2() {
       {/* Quick Filters */}
       <div className="flex flex-wrap items-center gap-2">
         {/* Status Filters */}
-        {STATUS_FILTERS.map((f) => (
+        {statusFilters.map((f) => (
           <button
             key={f.key}
             onClick={() => setActiveFilter(activeFilter === f.key ? "all" : f.key)}
@@ -518,8 +606,10 @@ export default function RequestLoggerV2() {
 
       {/* Column Visibility Toggles */}
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className="text-[10px] text-text-muted uppercase tracking-wider mr-1">Columns</span>
-        {COLUMNS.map((col) => (
+        <span className="text-[10px] text-text-muted uppercase tracking-wider mr-1">
+          {t("columnsLabel")}
+        </span>
+        {columns.map((col) => (
           <button
             key={col.key}
             onClick={() => toggleColumn(col.key)}
@@ -536,20 +626,21 @@ export default function RequestLoggerV2() {
 
       {/* Table */}
       <Card className="overflow-hidden bg-black/5 dark:bg-black/20">
-        <div className="p-0 overflow-x-auto max-h-[calc(100vh-320px)] overflow-y-auto">
+        <div
+          ref={scrollContainerRef}
+          className="p-0 overflow-x-auto max-h-[calc(100vh-320px)] overflow-y-auto"
+        >
           {loading && logs.length === 0 ? (
-            <div className="p-8 text-center text-text-muted">Loading logs...</div>
+            <div className="p-8 text-center text-text-muted">{t("loadingLogs")}</div>
           ) : logs.length === 0 ? (
             <div className="p-8 text-center text-text-muted">
               <span className="material-symbols-outlined text-[48px] mb-2 block opacity-40">
                 receipt_long
               </span>
-              No logs recorded yet. Make some API calls to see them here.
+              {t("noLogs")}
             </div>
           ) : sortedLogs.length === 0 ? (
-            <div className="p-8 text-center text-text-muted">
-              No logs match the current filters.
-            </div>
+            <div className="p-8 text-center text-text-muted">{t("noMatchingLogs")}</div>
           ) : (
             <table className="w-full text-left border-collapse text-xs">
               <thead
@@ -562,57 +653,67 @@ export default function RequestLoggerV2() {
                 >
                   {visibleColumns.status && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Status
+                      {t("columns.status")}
+                    </th>
+                  )}
+                  {visibleColumns.cacheSource && (
+                    <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
+                      {t("columns.cacheSource")}
                     </th>
                   )}
                   {visibleColumns.model && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Model
+                      {t("columns.model")}
                     </th>
                   )}
                   {visibleColumns.requestedModel && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Requested
+                      {t("columns.requested")}
                     </th>
                   )}
                   {visibleColumns.provider && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Provider
+                      {t("columns.provider")}
                     </th>
                   )}
                   {visibleColumns.protocol && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Req Protocol
+                      {t("columns.protocol")}
                     </th>
                   )}
                   {visibleColumns.account && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Account
+                      {t("columns.account")}
                     </th>
                   )}
                   {visibleColumns.apiKey && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      API Key
+                      {t("columns.apiKey")}
                     </th>
                   )}
                   {visibleColumns.combo && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                      Combo
+                      {t("columns.combo")}
                     </th>
                   )}
                   {visibleColumns.tokens && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px] text-right">
-                      Tokens
+                      {t("columns.tokens")}
+                    </th>
+                  )}
+                  {visibleColumns.tps && (
+                    <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px] text-right">
+                      {t("columns.tps")}
                     </th>
                   )}
                   {visibleColumns.duration && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px] text-right">
-                      Duration
+                      {t("columns.duration")}
                     </th>
                   )}
                   {visibleColumns.time && (
                     <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px] text-right">
-                      Time
+                      {t("columns.time")}
                     </th>
                   )}
                 </tr>
@@ -621,12 +722,7 @@ export default function RequestLoggerV2() {
                 {sortedLogs.map((log) => {
                   const statusStyle = getStatusStyle(log.status);
                   const protocolKey = log.sourceFormat || log.provider;
-                  const protocol = PROTOCOL_COLORS[protocolKey] ||
-                    PROTOCOL_COLORS[log.provider] || {
-                      bg: "#6B7280",
-                      text: "#fff",
-                      label: (protocolKey || log.provider || "-").toUpperCase(),
-                    };
+                  const protocol = getProtocolColor(protocolKey, log.provider);
                   const compatLabel = getProviderDisplayLabel(log.provider, providerNodes);
                   const providerColor = PROVIDER_COLORS[log.provider] || {
                     bg: "#374151",
@@ -635,6 +731,9 @@ export default function RequestLoggerV2() {
                   };
                   const providerLabel = compatLabel || providerColor.label;
                   const isError = log.status >= 400;
+                  const cacheSourceMeta = getCacheSourceMeta(log.cacheSource);
+                  const isSemanticCache = cacheSourceMeta.key === "semantic";
+                  const accountLabel = maskAccount(log.account, emailsVisible);
 
                   return (
                     <tr
@@ -649,6 +748,16 @@ export default function RequestLoggerV2() {
                             style={{ backgroundColor: statusStyle.bg, color: statusStyle.text }}
                           >
                             {log.status || "..."}
+                          </span>
+                        </td>
+                      )}
+                      {visibleColumns.cacheSource && (
+                        <td className="px-3 py-2">
+                          <span
+                            className={`inline-block px-2 py-0.5 rounded text-[9px] font-bold uppercase ${cacheSourceMeta.className}`}
+                            title={isSemanticCache ? t("semanticCacheHit") : t("upstreamResponse")}
+                          >
+                            {isSemanticCache ? t("semantic") : t("upstream")}
                           </span>
                         </td>
                       )}
@@ -668,7 +777,10 @@ export default function RequestLoggerV2() {
                               }
                               title={
                                 log.requestedModel !== log.model
-                                  ? `Requested ${log.requestedModel}, routed as ${log.model}`
+                                  ? t("requestedRoutedTitle", {
+                                      requested: log.requestedModel,
+                                      routed: log.model,
+                                    })
                                   : log.requestedModel
                               }
                             >
@@ -702,15 +814,15 @@ export default function RequestLoggerV2() {
                       {visibleColumns.account && (
                         <td
                           className="px-3 py-2 text-text-muted truncate max-w-[120px]"
-                          title={log.account}
+                          title={accountLabel}
                         >
-                          {maskAccount(log.account)}
+                          {accountLabel}
                         </td>
                       )}
                       {visibleColumns.apiKey && (
                         <td
                           className="px-3 py-2 text-text-muted truncate max-w-[140px]"
-                          title={log.apiKeyName || log.apiKeyId || "No API key"}
+                          title={log.apiKeyName || log.apiKeyId || t("noApiKey")}
                         >
                           {formatApiKeyLabel(log.apiKeyName, log.apiKeyId)}
                         </td>
@@ -737,6 +849,37 @@ export default function RequestLoggerV2() {
                           <span className="text-emerald-700 dark:text-emerald-400">
                             {log.tokens?.out?.toLocaleString() || 0}
                           </span>
+                          {log.tokens?.compressed != null && log.tokens.compressed > 0 && (
+                            <>
+                              <span className="mx-1 text-border">|</span>
+                              <span
+                                className="text-purple-500 dark:text-purple-400 font-semibold"
+                                title={`${log.tokens.compressed.toLocaleString()} tokens compressed`}
+                              >
+                                ↓{log.tokens.compressed.toLocaleString()}
+                              </span>
+                            </>
+                          )}
+                        </td>
+                      )}
+                      {visibleColumns.tps && (
+                        <td className="px-3 py-2 text-right whitespace-nowrap font-mono">
+                          {(() => {
+                            const tps = getLogTps(log);
+                            const color =
+                              tps <= 0
+                                ? "text-text-muted"
+                                : tps >= 80
+                                  ? "text-emerald-600 dark:text-emerald-400"
+                                  : tps >= 30
+                                    ? "text-sky-600 dark:text-sky-400"
+                                    : "text-amber-600 dark:text-amber-400";
+                            return (
+                              <span className={color} title={`${tps.toFixed(2)} tokens/sec`}>
+                                {formatTps(tps)}
+                              </span>
+                            );
+                          })()}
                         </td>
                       )}
                       {visibleColumns.duration && (
@@ -755,12 +898,30 @@ export default function RequestLoggerV2() {
               </tbody>
             </table>
           )}
+
+          {hasMore && sortedLogs.length > 0 && (
+            <div
+              ref={loadMoreSentinelRef}
+              className="flex justify-center py-3 border-t border-border/30"
+            >
+              <button
+                type="button"
+                onClick={loadMore}
+                className="px-4 py-1.5 text-xs rounded-md border border-border bg-bg-subtle hover:bg-bg-muted text-text-muted transition-colors"
+              >
+                {loading ? t("loadingMore") : t("loadMore")}
+              </button>
+            </div>
+          )}
         </div>
       </Card>
 
       <div className="text-[10px] text-text-muted italic">
-        Call logs are also saved as JSON files to <code>{`{DATA_DIR}/call_logs/`}</code> and rotated
-        by <code>CALL_LOG_RETENTION_DAYS</code> and <code>CALL_LOG_MAX_ENTRIES</code>.
+        {t("callLogsInfo", {
+          dataDir: "{DATA_DIR}/call_logs/",
+          retentionDays: "CALL_LOG_RETENTION_DAYS",
+          maxEntries: "CALL_LOG_MAX_ENTRIES",
+        })}
       </div>
 
       {/* Detail Modal */}
@@ -769,6 +930,8 @@ export default function RequestLoggerV2() {
           log={selectedLog}
           detail={detailData}
           loading={detailLoading}
+          debugEnabled={detailLoggingEnabled}
+          emailsVisible={emailsVisible}
           onClose={closeDetail}
           onCopy={copyToClipboard}
         />

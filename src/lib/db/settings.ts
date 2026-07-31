@@ -6,13 +6,52 @@ import { getDbInstance } from "./core";
 import { backupDbFile } from "./backup";
 import { PROVIDER_ID_TO_ALIAS } from "@omniroute/open-sse/config/providerModels.ts";
 import { invalidateDbCache } from "./readCache";
-import { resolveProxyForConnectionFromRegistry } from "./proxies";
+import { getProxyRegistryGeneration, resolveProxyForScopeFromRegistry } from "./proxies";
 import { getComboModelProvider as getComboEntryProvider } from "@/lib/combos/steps";
+import { requestBodyLimitMbFromEnv } from "@/shared/constants/bodySize";
 
 type JsonRecord = Record<string, unknown>;
 type PricingModels = Record<string, JsonRecord>;
 type PricingByProvider = Record<string, PricingModels>;
+export type PricingSource = "default" | "litellm" | "modelsDev" | "user";
+export type PricingSourceMap = Record<string, Record<string, PricingSource>>;
 type ProxyValue = JsonRecord | string | null;
+type ProxyResolutionResult = {
+  proxy: ProxyValue;
+  level: string;
+  levelId: string | null;
+  source?: string;
+};
+type ProxyResolutionCacheEntry = {
+  generation: number;
+  registryGeneration: number;
+  result: ProxyResolutionResult;
+};
+
+const PROXY_RESOLUTION_CACHE_MAX_ENTRIES = 100;
+
+let proxyConfigGeneration = 0;
+const proxyResolutionCache = new Map<string, ProxyResolutionCacheEntry>();
+
+export function bumpProxyConfigGeneration() {
+  proxyConfigGeneration++;
+  proxyResolutionCache.clear();
+}
+
+function cacheProxyResolution(
+  connectionId: string,
+  generation: number,
+  registryGeneration: number,
+  result: ProxyResolutionResult
+) {
+  if (generation !== proxyConfigGeneration) return;
+  if (registryGeneration !== getProxyRegistryGeneration()) return;
+  if (proxyResolutionCache.size >= PROXY_RESOLUTION_CACHE_MAX_ENTRIES) {
+    const oldestKey = proxyResolutionCache.keys().next().value;
+    if (oldestKey) proxyResolutionCache.delete(oldestKey);
+  }
+  proxyResolutionCache.set(connectionId, { generation, registryGeneration, result });
+}
 type ProxyMap = Record<string, ProxyValue>;
 
 interface ProxyConfig {
@@ -43,12 +82,40 @@ export async function getSettings() {
   const db = getDbInstance();
   const rows = db.prepare("SELECT key, value FROM key_value WHERE namespace = 'settings'").all();
   const settings: Record<string, unknown> = {
-    cloudEnabled: false,
+    cloudEnabled: true,
+    tailscaleEnabled: false,
+    tailscaleUrl: "",
     stickyRoundRobinLimit: 3,
+    requestRetry: 3,
+    maxRetryIntervalSec: 30,
+    antigravitySignatureCacheMode: "enabled",
     requireLogin: true,
+    mcpEnabled: false,
+    a2aEnabled: false,
     hiddenSidebarItems: [],
+    sidebarSectionOrder: [],
+    sidebarItemOrder: {},
+    sidebarActivePreset: null,
+    hideEndpointCloudflaredTunnel: false,
+    hideEndpointTailscaleFunnel: false,
+    hideEndpointNgrokTunnel: false,
+    comboConfigMode: "guided",
+    codexServiceTier: { enabled: false },
+    claudeFastMode: { enabled: false, supportedModels: ["claude-opus-4-7", "claude-opus-4-6"] },
+    codexSessionAffinityTtlMs: 0,
     alwaysPreserveClientCache: "auto",
     idempotencyWindowMs: 5000,
+    wsAuth: false,
+    maxBodySizeMb: requestBodyLimitMbFromEnv(process.env.MAX_BODY_SIZE_BYTES),
+    debugMode: true,
+    // LOCAL_ONLY manage-scope bypass policy defaults (T-011 / spec §Data Model).
+    // Preserves PR #2473 behaviour on migration — the bypass starts ENABLED
+    // for `/api/mcp/` so existing manage-scope Bearer clients keep working.
+    // Operators flip the kill-switch to false (or drop the prefix) via the
+    // Settings UI; the change hot-reloads through `applyRuntimeSettings` →
+    // `applyAuthzBypassSection` → `getAuthzBypassSnapshot()`.
+    localOnlyManageScopeBypassEnabled: true,
+    localOnlyManageScopeBypassPrefixes: ["/api/mcp/"],
   };
   for (const row of rows) {
     const record = toRecord(row);
@@ -87,7 +154,19 @@ export async function updateSettings(updates: Record<string, unknown>) {
   tx();
   backupDbFile("pre-write");
   invalidateDbCache("settings"); // Bust the read cache immediately
-  return getSettings();
+  const nextSettings = await getSettings();
+
+  try {
+    const { applyRuntimeSettings } = await import("@/lib/config/runtimeSettings");
+    await applyRuntimeSettings(nextSettings, { source: "settings:update" });
+  } catch (error) {
+    console.warn(
+      "[HOT_RELOAD] Failed to apply runtime settings after update:",
+      error instanceof Error ? error.message : error
+    );
+  }
+
+  return nextSettings;
 }
 
 export async function isCloudEnabled() {
@@ -97,73 +176,43 @@ export async function isCloudEnabled() {
 
 // ──────────────── Pricing ────────────────
 
-export async function getPricing() {
-  const db = getDbInstance();
+function readPricingNamespace(
+  db: ReturnType<typeof getDbInstance>,
+  namespace: string
+): PricingByProvider {
+  const rows = db.prepare("SELECT key, value FROM key_value WHERE namespace = ?").all(namespace);
+  const pricing: PricingByProvider = {};
 
-  // Layer 1: Hardcoded defaults (lowest priority)
-  const { getDefaultPricing } = await import("@/shared/constants/pricing");
-  const defaultPricing = getDefaultPricing();
-
-  // Layer 2: Synced external pricing from LiteLLM (middle-low priority)
-  const syncedRows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = 'pricing_synced'")
-    .all();
-  const syncedPricing: PricingByProvider = {};
-  for (const row of syncedRows) {
-    const record = toRecord(row);
-    const key = typeof record.key === "string" ? record.key : null;
-    const rawValue = typeof record.value === "string" ? record.value : null;
-    if (!key || rawValue === null) continue;
-    syncedPricing[key] = toRecord(JSON.parse(rawValue)) as PricingModels;
-  }
-
-  // Layer 3: Synced pricing from models.dev (middle-high priority)
-  const modelsDevRows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = 'models_dev_pricing'")
-    .all();
-  const modelsDevPricing: PricingByProvider = {};
-  for (const row of modelsDevRows) {
-    const record = toRecord(row);
-    const key = typeof record.key === "string" ? record.key : null;
-    const rawValue = typeof record.value === "string" ? record.value : null;
-    if (!key || rawValue === null) continue;
-    try {
-      modelsDevPricing[key] = JSON.parse(rawValue) as PricingModels;
-    } catch {
-      // Corrupted data — skip silently, fallback to lower layers
-    }
-  }
-
-  // Layer 4: User overrides (highest priority)
-  const rows = db.prepare("SELECT key, value FROM key_value WHERE namespace = 'pricing'").all();
-  const userPricing: PricingByProvider = {};
   for (const row of rows) {
     const record = toRecord(row);
     const key = typeof record.key === "string" ? record.key : null;
     const rawValue = typeof record.value === "string" ? record.value : null;
     if (!key || rawValue === null) continue;
-    userPricing[key] = toRecord(JSON.parse(rawValue)) as PricingModels;
+
+    try {
+      pricing[key] = toRecord(JSON.parse(rawValue)) as PricingModels;
+    } catch {
+      // Corrupted data — skip silently, fallback to lower layers
+    }
   }
 
-  // Merge: defaults → LiteLLM → models.dev → user (each layer overrides the previous)
+  return pricing;
+}
+
+function mergePricingLayers(layers: PricingByProvider[]): PricingByProvider {
   const mergedPricing: PricingByProvider = {};
 
-  // Start with defaults
-  for (const [provider, models] of Object.entries(defaultPricing) as Array<[string, unknown]>) {
-    mergedPricing[provider] = { ...(toRecord(models) as PricingModels) };
-  }
-
-  // Layer synced (LiteLLM), then models.dev, then user on top
-  for (const layer of [syncedPricing, modelsDevPricing, userPricing]) {
+  for (const layer of layers) {
     for (const [provider, models] of Object.entries(layer)) {
       if (!mergedPricing[provider]) {
         mergedPricing[provider] = { ...models };
-      } else {
-        for (const [model, pricing] of Object.entries(models)) {
-          mergedPricing[provider][model] = mergedPricing[provider][model]
-            ? { ...(mergedPricing[provider][model] || {}), ...toRecord(pricing) }
-            : pricing;
-        }
+        continue;
+      }
+
+      for (const [model, pricing] of Object.entries(models)) {
+        mergedPricing[provider][model] = mergedPricing[provider][model]
+          ? { ...(mergedPricing[provider][model] || {}), ...toRecord(pricing) }
+          : pricing;
       }
     }
   }
@@ -171,18 +220,119 @@ export async function getPricing() {
   return mergedPricing;
 }
 
+function buildPricingSourceMap(layers: {
+  defaults: PricingByProvider;
+  litellm: PricingByProvider;
+  modelsDev: PricingByProvider;
+  user: PricingByProvider;
+}): PricingSourceMap {
+  const sourceMap: PricingSourceMap = {};
+  const mergedPricing = mergePricingLayers([
+    layers.defaults,
+    layers.litellm,
+    layers.modelsDev,
+    layers.user,
+  ]);
+
+  for (const [provider, models] of Object.entries(mergedPricing)) {
+    sourceMap[provider] = {};
+
+    for (const model of Object.keys(models)) {
+      if (layers.user[provider]?.[model]) {
+        sourceMap[provider][model] = "user";
+      } else if (layers.modelsDev[provider]?.[model]) {
+        sourceMap[provider][model] = "modelsDev";
+      } else if (layers.litellm[provider]?.[model]) {
+        sourceMap[provider][model] = "litellm";
+      } else {
+        sourceMap[provider][model] = "default";
+      }
+    }
+  }
+
+  return sourceMap;
+}
+
+async function getPricingLayers() {
+  const db = getDbInstance();
+
+  // Layer 1: Hardcoded defaults (lowest priority)
+  const { getDefaultPricing } = await import("@/shared/constants/pricing");
+  return {
+    defaults: getDefaultPricing(),
+    litellm: readPricingNamespace(db, "pricing_synced"),
+    modelsDev: readPricingNamespace(db, "models_dev_pricing"),
+    user: readPricingNamespace(db, "pricing"),
+  };
+}
+
+export async function getPricing() {
+  const layers = await getPricingLayers();
+  // Merge: defaults → LiteLLM → models.dev → user (each layer overrides the previous)
+  return mergePricingLayers([layers.defaults, layers.litellm, layers.modelsDev, layers.user]);
+}
+
+export async function getPricingWithSources(): Promise<{
+  pricing: PricingByProvider;
+  sourceMap: PricingSourceMap;
+}> {
+  const layers = await getPricingLayers();
+  return {
+    pricing: mergePricingLayers([layers.defaults, layers.litellm, layers.modelsDev, layers.user]),
+    sourceMap: buildPricingSourceMap(layers),
+  };
+}
+
 export async function getPricingForModel(provider: string, model: string) {
   const pricing = await getPricing();
-  if (pricing[provider]?.[model]) return pricing[provider][model];
 
-  const { PROVIDER_ID_TO_ALIAS } = await import("@omniroute/open-sse/config/providerModels");
-  const alias = PROVIDER_ID_TO_ALIAS[provider];
-  if (alias && pricing[alias]) return pricing[alias][model] || null;
+  const findKeyInsensitive = <T>(
+    obj: Record<string, T> | undefined | null,
+    key: string
+  ): T | undefined => {
+    if (!obj || !key) return undefined;
+    const lowerKey = key.toLowerCase();
+    for (const [k, v] of Object.entries(obj)) {
+      if (k.toLowerCase() === lowerKey) return v;
+    }
+    return undefined;
+  };
 
-  const np = provider?.replace(/-cn$/, "");
-  if (np && np !== provider && pricing[np]) return pricing[np][model] || null;
+  const pLower = (provider || "").toLowerCase();
+  let providerPricing = findKeyInsensitive<PricingModels>(pricing, pLower);
 
-  return null;
+  if (!providerPricing) {
+    const alias = findKeyInsensitive<string>(PROVIDER_ID_TO_ALIAS, pLower);
+    if (alias) providerPricing = findKeyInsensitive(pricing, alias);
+  }
+
+  if (!providerPricing) {
+    for (const [id, mappedAlias] of Object.entries(PROVIDER_ID_TO_ALIAS)) {
+      if (typeof mappedAlias === "string" && mappedAlias.toLowerCase() === pLower) {
+        providerPricing = findKeyInsensitive(pricing, id);
+        if (providerPricing) break;
+      }
+    }
+  }
+
+  if (!providerPricing) {
+    const np = pLower.replace(/-cn$/, "");
+    if (np && np !== pLower) {
+      providerPricing = findKeyInsensitive(pricing, np);
+    }
+  }
+
+  if (!providerPricing) return null;
+
+  const mLower = (model || "").toLowerCase();
+  let modelPricing = findKeyInsensitive<JsonRecord>(providerPricing, mLower);
+
+  if (!modelPricing) {
+    const hyphenModel = mLower.replace(/\./g, "-");
+    modelPricing = findKeyInsensitive(providerPricing, hyphenModel);
+  }
+
+  return modelPricing || null;
 }
 
 export async function updatePricing(pricingData: PricingByProvider) {
@@ -268,7 +418,12 @@ export async function resetAllPricing() {
 
 // ──────────────── LKGP (Last Known Good Provider) ────────────────
 
-export async function getLKGP(comboName: string, modelId: string): Promise<string | null> {
+export interface LKGPRecord {
+  provider: string;
+  connectionId?: string;
+}
+
+export async function getLKGP(comboName: string, modelId: string): Promise<LKGPRecord | null> {
   const db = getDbInstance();
   const key = `${comboName}:${modelId}`;
   const row = db
@@ -276,18 +431,29 @@ export async function getLKGP(comboName: string, modelId: string): Promise<strin
     .get(key) as { value?: string } | undefined;
   if (!row?.value) return null;
   try {
-    return JSON.parse(row.value);
+    const parsed = JSON.parse(row.value);
+    if (typeof parsed === "object" && parsed !== null && "provider" in parsed) {
+      return parsed as LKGPRecord;
+    }
+    return { provider: String(parsed) };
   } catch {
-    return row.value;
+    return { provider: row.value };
   }
 }
 
-export async function setLKGP(comboName: string, modelId: string, providerId: string) {
+export async function setLKGP(
+  comboName: string,
+  modelId: string,
+  providerId: string,
+  connectionId?: string
+) {
   const db = getDbInstance();
   const key = `${comboName}:${modelId}`;
+  const value: LKGPRecord = { provider: providerId };
+  if (connectionId) value.connectionId = connectionId;
   db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('lkgp', ?, ?)").run(
     key,
-    JSON.stringify(providerId)
+    JSON.stringify(value)
   );
 }
 
@@ -418,6 +584,7 @@ export async function setProxyForLevel(level: string, id: string | null, proxy: 
   }
 
   backupDbFile("pre-write");
+  bumpProxyConfigGeneration();
   return config;
 }
 
@@ -426,15 +593,33 @@ export async function deleteProxyForLevel(level: string, id: string | null) {
 }
 
 export async function resolveProxyForConnection(connectionId: string) {
-  const registryResolved = await resolveProxyForConnectionFromRegistry(connectionId);
-  if (registryResolved?.proxy) {
-    return registryResolved;
+  const startGeneration = proxyConfigGeneration;
+  const startRegistryGeneration = getProxyRegistryGeneration();
+  const cached = proxyResolutionCache.get(connectionId);
+  if (
+    cached &&
+    cached.generation === startGeneration &&
+    cached.registryGeneration === startRegistryGeneration
+  ) {
+    return cached.result;
   }
 
   const config = await getProxyConfig();
 
+  // Resolve by specificity across both proxy storage backends. The dashboard
+  // Custom tab still writes account/provider proxies to the legacy config,
+  // while Saved Proxy writes registry assignments. Do not let a registry-global
+  // fallback shadow a more-specific legacy account/provider proxy (#2601).
+  const registryAccount = await resolveProxyForScopeFromRegistry("account", connectionId);
+  if (registryAccount?.proxy) {
+    cacheProxyResolution(connectionId, startGeneration, startRegistryGeneration, registryAccount);
+    return registryAccount;
+  }
+
   if (connectionId && config.keys?.[connectionId]) {
-    return { proxy: config.keys[connectionId], level: "key", levelId: connectionId };
+    const result = { proxy: config.keys[connectionId], level: "key", levelId: connectionId };
+    cacheProxyResolution(connectionId, startGeneration, startRegistryGeneration, result);
+    return result;
   }
 
   const db = getDbInstance();
@@ -446,6 +631,12 @@ export async function resolveProxyForConnection(connectionId: string) {
     const connectionRecord = toRecord(connection);
     const provider =
       typeof connectionRecord.provider === "string" ? connectionRecord.provider : null;
+
+    if (provider) {
+      const registryProvider = await resolveProxyForScopeFromRegistry("provider", provider);
+      if (registryProvider?.proxy) return registryProvider;
+    }
+
     if (config.combos && Object.keys(config.combos).length > 0) {
       const combos = db.prepare("SELECT id, data FROM combos").all();
       for (const comboRow of combos) {
@@ -479,10 +670,12 @@ export async function resolveProxyForConnection(connectionId: string) {
     }
   }
 
+  const registryGlobal = await resolveProxyForScopeFromRegistry("global");
+  if (registryGlobal?.proxy) return registryGlobal;
+
   if (config.global) {
     return { proxy: config.global, level: "global", levelId: null };
   }
-
   return { proxy: null, level: "direct", levelId: null };
 }
 
@@ -519,6 +712,7 @@ export async function setProxyConfig(config: Record<string, unknown>) {
   tx();
 
   backupDbFile("pre-write");
+  bumpProxyConfigGeneration();
   return current;
 }
 
@@ -588,21 +782,19 @@ export async function getCacheMetrics() {
       cacheCreationTokens: number | null;
     }>;
 
-    // Aggregate by strategy
-    // Since combo_strategy isn't tracked in usage_history yet, we use 'direct' for all requests
-    // TODO: Add combo_strategy column to usage_history for proper strategy tracking
+    // Aggregate by combo strategy (direct requests stored as 'direct')
     const byStrategyRows = db
       .prepare(
         `
       SELECT
-        'direct' as strategy,
+        COALESCE(combo_strategy, 'direct') as strategy,
         COUNT(*) as requests,
         SUM(tokens_input) as inputTokens,
         SUM(tokens_cache_read) as cachedTokens,
         SUM(tokens_cache_creation) as cacheCreationTokens
       FROM usage_history
       WHERE (tokens_cache_read > 0 OR tokens_cache_creation > 0)
-      GROUP BY 'direct'
+      GROUP BY combo_strategy
     `
       )
       .all() as Array<{

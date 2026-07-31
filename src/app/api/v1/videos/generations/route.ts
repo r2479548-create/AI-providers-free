@@ -1,4 +1,3 @@
-import { CORS_ORIGIN } from "@/shared/utils/cors";
 import { handleVideoGeneration } from "@omniroute/open-sse/handlers/videoGeneration.ts";
 import {
   getProviderCredentials,
@@ -18,6 +17,10 @@ import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { v1ImageGenerationSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import {
+  isAllRateLimitedCredentials,
+  rateLimitedProviderResponse,
+} from "@/app/api/v1/_shared/rateLimit";
 
 /**
  * Handle CORS preflight
@@ -25,7 +28,6 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 export async function OPTIONS() {
   return new Response(null, {
     headers: {
-      "Access-Control-Allow-Origin": CORS_ORIGIN,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "*",
     },
@@ -72,16 +74,8 @@ export async function POST(request) {
   }
   const body = validation.data;
 
-  // Optional API key validation
-  if (process.env.REQUIRE_API_KEY === "true") {
-    const apiKey = extractApiKey(request);
-    if (!apiKey) {
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
-    }
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) {
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
-    }
+  if (typeof body.prompt !== "string" || body.prompt.trim().length === 0) {
+    return errorResponse(HTTP_STATUS.BAD_REQUEST, "Prompt is required");
   }
 
   // Enforce API key policies (model restrictions + budget limits)
@@ -109,6 +103,9 @@ export async function POST(request) {
         HTTP_STATUS.BAD_REQUEST,
         `No credentials for video provider: ${provider}`
       );
+    }
+    if (isAllRateLimitedCredentials(credentials)) {
+      return rateLimitedProviderResponse(provider, credentials);
     }
   }
 

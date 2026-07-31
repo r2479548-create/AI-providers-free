@@ -1,4 +1,9 @@
-import { BaseExecutor, type ExecuteInput, type ProviderCredentials } from "./base.ts";
+import {
+  BaseExecutor,
+  setUserAgentHeader,
+  type ExecuteInput,
+  type ProviderCredentials,
+} from "./base.ts";
 import { PROVIDERS } from "../config/constants.ts";
 import { getModelTargetFormat } from "../config/providerModels.ts";
 
@@ -40,7 +45,12 @@ export class OpencodeExecutor extends BaseExecutor {
     }
   }
 
-  buildHeaders(credentials: ProviderCredentials | null, stream = true) {
+  buildHeaders(
+    credentials: ProviderCredentials | null,
+    stream = true,
+    clientHeaders?: Record<string, string> | null,
+    model?: string
+  ) {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     const key = credentials?.apiKey || credentials?.accessToken;
 
@@ -60,6 +70,49 @@ export class OpencodeExecutor extends BaseExecutor {
       headers["Accept"] = "text/event-stream";
     }
 
+    if (clientHeaders) {
+      const clientUA = clientHeaders["User-Agent"] || clientHeaders["user-agent"];
+      if (clientUA) {
+        setUserAgentHeader(headers, clientUA);
+      }
+
+      // Forward OpenCode request metadata headers from client
+      const opencodeHeaderKeys = [
+        "x-opencode-session",
+        "x-opencode-request",
+        "x-opencode-project",
+        "x-opencode-client",
+      ];
+      for (const headerName of opencodeHeaderKeys) {
+        const value = Object.entries(clientHeaders).find(
+          ([key]) => key.toLowerCase() === headerName.toLowerCase()
+        )?.[1];
+        if (value) {
+          headers[headerName] = value;
+        }
+      }
+    }
+
+    void model;
+
     return headers;
+  }
+
+  transformRequest(
+    model: string,
+    body: any,
+    stream: boolean,
+    credentials: ProviderCredentials
+  ): any {
+    const modifiedBody = super.transformRequest(model, body, stream, credentials);
+    if (
+      modifiedBody &&
+      typeof modifiedBody === "object" &&
+      Array.isArray(modifiedBody.tools) &&
+      modifiedBody.tools.length > 128
+    ) {
+      modifiedBody.tools = modifiedBody.tools.slice(0, 128);
+    }
+    return modifiedBody;
   }
 }

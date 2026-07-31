@@ -3,12 +3,13 @@ import * as log from "../utils/logger";
 import { updateProviderConnection, resolveProxyForProvider } from "@/lib/localDb";
 import {
   TOKEN_EXPIRY_BUFFER_MS as BUFFER_MS,
+  getRefreshLeadMs as _getRefreshLeadMs,
   refreshAccessToken as _refreshAccessToken,
   refreshClaudeOAuthToken as _refreshClaudeOAuthToken,
   refreshGoogleToken as _refreshGoogleToken,
   refreshQwenToken as _refreshQwenToken,
   refreshCodexToken as _refreshCodexToken,
-  refreshIflowToken as _refreshIflowToken,
+  refreshQoderToken as _refreshQoderToken,
   refreshGitHubToken as _refreshGitHubToken,
   refreshCopilotToken as _refreshCopilotToken,
   getAccessToken as _getAccessToken,
@@ -16,6 +17,14 @@ import {
   formatProviderCredentials as _formatProviderCredentials,
   getAllAccessTokens as _getAllAccessTokens,
 } from "@omniroute/open-sse/services/tokenRefresh.ts";
+
+// DEPRECATED: withConnectionRefreshMutex was removed. The per-connection mutex
+// is now consolidated in open-sse/services/tokenRefresh.ts and protected by
+// passing an `onPersist` callback to `getAccessToken`, which runs the DB write
+// INSIDE the mutex closure (atomic [network + persist]). The old src/sse-side
+// mutex Map was redundant and created the illusion of two locks when there was
+// actually only one. Removing it eliminates the dual-Map confusion. See
+// docs/architecture/SSE_BOUNDARY.md and tests/unit/token-refresh-race-comprehensive.test.ts.
 
 export const TOKEN_EXPIRY_BUFFER_MS = BUFFER_MS;
 
@@ -53,9 +62,9 @@ export const refreshCodexToken = async (refreshToken: string) => {
   return _refreshCodexToken(refreshToken, log, proxy);
 };
 
-export const refreshIflowToken = async (refreshToken: string) => {
+export const refreshQoderToken = async (refreshToken: string) => {
   const proxy = await resolveProxyForProvider("qoder");
-  return _refreshIflowToken(refreshToken, log, proxy);
+  return _refreshQoderToken(refreshToken, log, proxy);
 };
 
 export const refreshGitHubToken = async (refreshToken: string) => {
@@ -68,9 +77,13 @@ export const refreshCopilotToken = async (githubAccessToken: string) => {
   return _refreshCopilotToken(githubAccessToken, log, proxy);
 };
 
-export const getAccessToken = async (provider: string, credentials: any) => {
+export const getAccessToken = async (
+  provider: string,
+  credentials: any,
+  onPersist?: (result: any) => Promise<void>
+) => {
   const proxy = await resolveProxyForProvider(provider);
-  return _getAccessToken(provider, credentials, log, proxy);
+  return _getAccessToken(provider, credentials, log, proxy, onPersist);
 };
 
 export const refreshTokenByProvider = async (provider: string, credentials: any) => {
@@ -95,11 +108,28 @@ export async function updateProviderCredentials(connectionId: string, newCredent
       updates.refreshToken = newCredentials.refreshToken;
     }
     if (newCredentials.expiresIn) {
-      updates.expiresAt = new Date(Date.now() + newCredentials.expiresIn * 1000).toISOString();
+      const expiresAt = new Date(Date.now() + newCredentials.expiresIn * 1000).toISOString();
+      updates.expiresAt = expiresAt;
+      updates.tokenExpiresAt = expiresAt;
       updates.expiresIn = newCredentials.expiresIn;
+    } else if (newCredentials.expiresAt) {
+      updates.expiresAt = newCredentials.expiresAt;
+      updates.tokenExpiresAt = newCredentials.expiresAt;
     }
     if (newCredentials.providerSpecificData) {
       updates.providerSpecificData = newCredentials.providerSpecificData;
+    }
+    // Cookie/session providers (chatgpt-web, ...) refresh by rotating the
+    // stored apiKey blob — propagate that here too so DB credentials don't
+    // go stale after Set-Cookie rotation.
+    if (newCredentials.apiKey) {
+      updates.apiKey = newCredentials.apiKey;
+    }
+    if (newCredentials.testStatus) {
+      updates.testStatus = newCredentials.testStatus;
+    }
+    if (newCredentials.isActive !== undefined) {
+      updates.isActive = newCredentials.isActive;
     }
 
     const result = await updateProviderConnection(connectionId, updates);
@@ -121,28 +151,52 @@ export async function updateProviderCredentials(connectionId: string, newCredent
 export async function checkAndRefreshToken(provider: string, credentials: any) {
   let updatedCredentials = { ...credentials };
 
-  // Check regular token expiry
+  // Check regular token expiry. Use the provider-specific lead time so rotating-
+  // token providers (Codex/OpenAI) refresh FAR ahead of access_token expiry. This
+  // keeps the refresh_token "warm" — refreshed regularly enough that Auth0 doesn't
+  // mark it as stale and revoke the token family on first use after long idle.
   if (updatedCredentials.expiresAt) {
     const expiresAt = new Date(updatedCredentials.expiresAt).getTime();
     const now = Date.now();
+    const refreshLead = _getRefreshLeadMs(provider);
 
-    if (expiresAt - now < TOKEN_EXPIRY_BUFFER_MS) {
+    if (expiresAt - now < refreshLead) {
       log.info("TOKEN_REFRESH", "Token expiring soon, refreshing proactively", {
         provider,
         expiresIn: Math.round((expiresAt - now) / 1000),
+        refreshLeadMs: refreshLead,
       });
 
-      const newCredentials = await getAccessToken(provider, updatedCredentials);
+      const connectionId: string | undefined = updatedCredentials.connectionId;
+
+      // Pass onPersist so the DB write happens INSIDE the open-sse per-connection
+      // mutex, making [network call + DB write] one atomic step. This eliminates the
+      // race where a concurrent request reads stale DB credentials before the write
+      // and re-uses a rotated refresh token (refresh_token_reused on Codex/OpenAI).
+      // The separate withConnectionRefreshMutex wrapper is no longer needed here.
+      const persistCallback = connectionId
+        ? async (result: any) => {
+            await updateProviderCredentials(connectionId, result);
+          }
+        : undefined;
+
+      const newCredentials = await getAccessToken(provider, updatedCredentials, persistCallback);
+
       if (newCredentials && newCredentials.accessToken) {
-        await updateProviderCredentials(updatedCredentials.connectionId, newCredentials);
+        // For the no-connectionId path (no mutex, no onPersist), persist here as before.
+        if (!connectionId) {
+          await updateProviderCredentials(updatedCredentials.connectionId, newCredentials);
+        }
 
         updatedCredentials = {
           ...updatedCredentials,
           accessToken: newCredentials.accessToken,
           refreshToken: newCredentials.refreshToken || updatedCredentials.refreshToken,
-          expiresAt: newCredentials.expiresIn
-            ? new Date(Date.now() + newCredentials.expiresIn * 1000).toISOString()
-            : updatedCredentials.expiresAt,
+          expiresAt: newCredentials.expiresAt
+            ? newCredentials.expiresAt
+            : newCredentials.expiresIn
+              ? new Date(Date.now() + newCredentials.expiresIn * 1000).toISOString()
+              : updatedCredentials.expiresAt,
         };
       }
     }

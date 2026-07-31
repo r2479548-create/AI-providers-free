@@ -3,6 +3,7 @@ import { getModelAliases, setModelAlias, getProviderConnections } from "@/models
 import { AI_MODELS, PROVIDER_ID_TO_ALIAS } from "@/shared/constants/models";
 import { updateModelAliasSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import { hasEligibleConnectionForModel } from "@/domain/connectionModelRules";
 
 // GET /api/models - Get models with aliases (only from active providers by default)
 export async function GET(request: Request) {
@@ -24,11 +25,50 @@ export async function GET(request: Request) {
         // Without this, models for aliased providers always appear unconfigured.
         activeProviders = new Set<string>();
         for (const c of active) {
-          const pId = String((c as any).provider);
+          const pId = String((c as Record<string, unknown>).provider);
           activeProviders.add(pId);
           const alias = PROVIDER_ID_TO_ALIAS[pId];
           if (alias) activeProviders.add(alias);
         }
+        const connectionsByProvider = new Map<string, typeof active>();
+        const registerConnectionKey = (
+          key: string | null | undefined,
+          connection: (typeof active)[number]
+        ) => {
+          if (!key) return;
+          const existing = connectionsByProvider.get(key) || [];
+          existing.push(connection);
+          connectionsByProvider.set(key, existing);
+        };
+        for (const connection of active) {
+          registerConnectionKey(connection.provider, connection);
+          registerConnectionKey(PROVIDER_ID_TO_ALIAS[connection.provider], connection);
+        }
+        const getConnectionsForProvider = (...keys: Array<string | null | undefined>) => {
+          const seen = new Set<string>();
+          const collected: typeof active = [];
+          for (const key of keys) {
+            if (!key) continue;
+            for (const connection of connectionsByProvider.get(key) || []) {
+              if (!connection?.id || seen.has(connection.id)) continue;
+              seen.add(connection.id);
+              collected.push(connection);
+            }
+          }
+          return collected;
+        };
+
+        activeProviders = new Set(
+          AI_MODELS.flatMap((model: any) => {
+            const providerKeys = [model.provider, PROVIDER_ID_TO_ALIAS[model.provider]];
+            return hasEligibleConnectionForModel(
+              getConnectionsForProvider(...providerKeys),
+              model.model
+            )
+              ? providerKeys.filter(Boolean)
+              : [];
+          })
+        );
       } catch {
         // If DB unavailable, show all models
       }

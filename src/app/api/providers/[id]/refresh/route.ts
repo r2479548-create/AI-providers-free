@@ -1,6 +1,12 @@
 import { NextResponse } from "next/server";
-import { getProviderConnectionById } from "@/models";
+import { getProviderConnectionById, updateProviderConnection } from "@/lib/db/providers";
 import { getAccessToken, updateProviderCredentials } from "@/sse/services/tokenRefresh";
+
+type RefreshResult = {
+  accessToken?: string;
+  expiresIn?: number;
+  error?: string;
+};
 
 /**
  * POST /api/providers/[id]/refresh
@@ -33,7 +39,11 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
       );
     }
 
-    const provider = connection.provider as string;
+    if (typeof connection.provider !== "string" || connection.provider.length === 0) {
+      return NextResponse.json({ error: "Connection provider is invalid" }, { status: 422 });
+    }
+
+    const provider = connection.provider;
     const credentials = {
       connectionId: id,
       accessToken: connection.accessToken,
@@ -45,8 +55,32 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
     };
 
     // Use the existing getAccessToken helper which knows how to refresh
-    // tokens for each provider type (Claude, GitHub, Gemini, etc.)
-    const newCredentials = await getAccessToken(provider, credentials);
+    // tokens for each provider type (Claude, GitHub, Gemini, etc.).
+    // Pass onPersist so the DB write happens atomically INSIDE the per-connection
+    // mutex — prevents the race where a concurrent request reads stale credentials
+    // between the network call and the DB update.
+    let persistedCredentials: RefreshResult | null = null;
+    const newCredentials = (await getAccessToken(provider, credentials, async (result) => {
+      await updateProviderCredentials(id, result);
+      persistedCredentials = result;
+    })) as RefreshResult | null;
+
+    if (newCredentials && typeof newCredentials === "object" && newCredentials.error) {
+      if (
+        newCredentials.error === "unrecoverable_refresh_error" ||
+        newCredentials.error === "refresh_token_reused" ||
+        newCredentials.error === "invalid_grant"
+      ) {
+        await updateProviderConnection(id, {
+          testStatus: "invalid",
+          lastError: "Refresh token expired. Please re-authenticate this account.",
+        });
+        return NextResponse.json(
+          { error: "Token refresh failed — provider returned no new token", requiresReauth: true },
+          { status: 401 }
+        );
+      }
+    }
 
     if (!newCredentials?.accessToken) {
       return NextResponse.json(
@@ -55,12 +89,17 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
       );
     }
 
-    // Persist new credentials to DB
-    await updateProviderCredentials(id, newCredentials);
+    // If onPersist was not called (e.g. no connectionId in credentials path), persist now.
+    if (!persistedCredentials) {
+      await updateProviderCredentials(id, newCredentials);
+    }
 
-    const expiresAt = newCredentials.expiresIn
-      ? new Date(Date.now() + newCredentials.expiresIn * 1000).toISOString()
-      : null;
+    const resolvedCreds = persistedCredentials || newCredentials;
+    const expiresAt = resolvedCreds.expiresAt
+      ? resolvedCreds.expiresAt
+      : resolvedCreds.expiresIn
+        ? new Date(Date.now() + resolvedCreds.expiresIn * 1000).toISOString()
+        : null;
 
     return NextResponse.json({
       success: true,

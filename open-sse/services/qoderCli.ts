@@ -348,7 +348,7 @@ MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
 XcW+ML9FoCI6AOvOzwIDAQAB
 -----END PUBLIC KEY-----`;
 
-function buildCosyHeadersForValidation(bodyStr: string, token: string) {
+export function buildCosyHeadersForValidation(bodyStr: string, token: string) {
   const aesKeyBytes = crypto.randomBytes(16);
   const aesKeyStr = aesKeyBytes.toString("hex").slice(0, 16);
   const aesKeyBuf = Buffer.from(aesKeyStr, "utf8");
@@ -401,7 +401,8 @@ export async function validateQoderCliPat({
   providerSpecificData?: JsonRecord;
 }) {
   // Resolve token: dashboard input → env var fallback
-  const resolvedToken = apiKey?.trim() || String(process.env.QODER_PERSONAL_ACCESS_TOKEN || "").trim();
+  const resolvedToken =
+    apiKey?.trim() || String(process.env.QODER_PERSONAL_ACCESS_TOKEN || "").trim();
 
   if (!resolvedToken) {
     return {
@@ -500,6 +501,15 @@ export async function validateQoderCliPat({
     // 4xx other than auth — token was accepted but request had issues (model, format, etc.)
     if (res.status >= 400 && res.status < 500) {
       return { valid: true, error: null, unsupported: false };
+    }
+
+    // Treat 5xx as valid bypass to prevent false negatives from legacy Qoder APIs (issue #1391)
+    if (res.status >= 500) {
+      return {
+        valid: true,
+        error: `Validation endpoint returned HTTP ${res.status}${errorDetail ? `: ${errorDetail}` : ""}, treating PAT as valid`,
+        unsupported: false,
+      };
     }
 
     return {

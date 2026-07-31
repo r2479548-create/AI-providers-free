@@ -75,7 +75,7 @@ export function createResponsesLogger(model, logsDir = null) {
  * @param {Object} logger - Optional logger instance
  * @returns {TransformStream}
  */
-export function createResponsesApiTransformStream(logger = null) {
+export function createResponsesApiTransformStream(logger = null, keepaliveIntervalMs = 3000) {
   const state = {
     seq: 0,
     responseId: `resp_${Date.now()}`,
@@ -99,6 +99,7 @@ export function createResponsesApiTransformStream(logger = null) {
     buffer: "",
     completedSent: false,
     usage: null,
+    keepaliveTimer: null,
   };
 
   const encoder = new TextEncoder();
@@ -221,7 +222,27 @@ export function createResponsesApiTransformStream(logger = null) {
   const closeToolCall = (controller, idx) => {
     const callId = state.funcCallIds[idx];
     if (callId && !state.funcItemDone[idx]) {
-      const args = state.funcArgsBuf[idx] || "{}";
+      let args = state.funcArgsBuf[idx] || "{}";
+
+      // Fix #1674 & #1852: Final cleanup of empty string and empty array placeholders
+      try {
+        const parsed = JSON.parse(args);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          let modified = false;
+          for (const [k, v] of Object.entries(parsed)) {
+            if (v === "" || (Array.isArray(v) && v.length === 0)) {
+              delete parsed[k];
+              modified = true;
+            }
+          }
+          if (modified) {
+            args = JSON.stringify(parsed);
+            state.funcArgsBuf[idx] = args;
+          }
+        }
+      } catch (e) {
+        // Ignore malformed JSON
+      }
 
       emit(controller, "response.function_call_arguments.done", {
         type: "response.function_call_arguments.done",
@@ -301,6 +322,12 @@ export function createResponsesApiTransformStream(logger = null) {
   };
 
   return new TransformStream({
+    start(controller) {
+      // Periodic keepalive heartbeat to prevent client timeouts (Codex CLI #2544)
+      state.keepaliveTimer = setInterval(() => {
+        controller.enqueue(encoder.encode(": keepalive\n\n"));
+      }, keepaliveIntervalMs);
+    },
     transform(chunk, controller) {
       const text = new TextDecoder().decode(chunk);
       logger?.logInput(text.trim());
@@ -399,6 +426,13 @@ export function createResponsesApiTransformStream(logger = null) {
 
           // Regular text content
           if (content) {
+            // Fix for #1211: Strip leading double-newlines / blank spaces from the very first text chunk
+            if (!state.msgTextBuf[idx]) {
+              content = content.trimStart();
+            }
+
+            if (!content) continue;
+
             if (!state.msgItemAdded[idx]) {
               state.msgItemAdded[idx] = true;
               const msgId = `msg_${state.responseId}_${idx}`;
@@ -477,15 +511,26 @@ export function createResponsesApiTransformStream(logger = null) {
 
             if (tc.function?.arguments) {
               const refCallId = state.funcCallIds[tcIdx] || newCallId;
+              let deltaStr = tc.function.arguments;
+
+              // Fix #1674 & #1852: Strip empty strings and empty arrays from streaming deltas
+              if (deltaStr.includes('""') || deltaStr.includes("[]") || deltaStr.includes("[ ]")) {
+                deltaStr = deltaStr
+                  .replace(/,"[a-zA-Z0-9_]+":""/g, "")
+                  .replace(/"[a-zA-Z0-9_]+":"",/g, "")
+                  .replace(/,"[a-zA-Z0-9_]+":\s*\[\s*\]/g, "")
+                  .replace(/"[a-zA-Z0-9_]+":\s*\[\s*\],?/g, "");
+              }
+
               if (refCallId) {
                 emit(controller, "response.function_call_arguments.delta", {
                   type: "response.function_call_arguments.delta",
                   item_id: `fc_${refCallId}`,
                   output_index: tcIdx,
-                  delta: tc.function.arguments,
+                  delta: deltaStr,
                 });
               }
-              state.funcArgsBuf[tcIdx] += tc.function.arguments;
+              state.funcArgsBuf[tcIdx] += deltaStr;
             }
           }
         }
@@ -501,6 +546,11 @@ export function createResponsesApiTransformStream(logger = null) {
     },
 
     flush(controller) {
+      // Clear keepalive timer
+      if (state.keepaliveTimer) {
+        clearInterval(state.keepaliveTimer);
+        state.keepaliveTimer = null;
+      }
       for (const i in state.msgItemAdded) closeMessage(controller, i);
       closeReasoning(controller);
       for (const i in state.funcCallIds) closeToolCall(controller, i);
