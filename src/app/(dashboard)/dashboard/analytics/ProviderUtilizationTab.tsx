@@ -1,16 +1,11 @@
 "use client";
 
+import { useTranslations } from "next-intl";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  CartesianGrid,
-  Legend,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
+import { useProviderNodeMap, resolveProviderName } from "@/lib/display/useProviderNodeMap";
+import dynamic from "next/dynamic";
+
+const ProviderCharts = dynamic(() => import("./components/ProviderCharts"), { ssr: false });
 import Card from "@/shared/components/Card";
 import ProviderIcon from "@/shared/components/ProviderIcon";
 import TimeRangeSelector from "@/shared/components/analytics/TimeRangeSelector";
@@ -19,13 +14,6 @@ import type {
   ProviderUtilizationResponse,
   UtilizationTimeRange,
 } from "@/shared/types/utilization";
-
-const RANGE_LABELS: Record<UtilizationTimeRange, string> = {
-  "1h": "Last hour",
-  "24h": "Last 24 hours",
-  "7d": "Last 7 days",
-  "30d": "Last 30 days",
-};
 
 const PROVIDER_COLORS = [
   "var(--color-primary)",
@@ -89,6 +77,8 @@ function getLatestPoints(points: ProviderUtilizationPoint[]) {
 }
 
 export default function ProviderUtilizationTab() {
+  const t = useTranslations("analytics");
+  const nodeMap = useProviderNodeMap();
   const [range, setRange] = useState<UtilizationTimeRange>("24h");
   const [aggregateBy, setAggregateBy] = useState<"provider" | "connection">("provider");
   const [data, setData] = useState<ProviderUtilizationResponse | null>(null);
@@ -191,8 +181,8 @@ export default function ProviderUtilizationTab() {
   return (
     <div className="flex flex-col gap-6">
       <Card
-        title="Provider utilization"
-        subtitle={RANGE_LABELS[range]}
+        title={t("providerUtilizationTitle")}
+        subtitle={t(`utilizationRange.${range}`)}
         icon="monitoring"
         action={
           <div className="flex items-center gap-4">
@@ -206,7 +196,7 @@ export default function ProviderUtilizationTab() {
                 }`}
               >
                 <span className="material-symbols-outlined text-[14px]">dns</span>
-                Global View
+                {t("providerUtilizationGlobalView")}
               </button>
               <button
                 onClick={() => setAggregateBy("connection")}
@@ -217,7 +207,7 @@ export default function ProviderUtilizationTab() {
                 }`}
               >
                 <span className="material-symbols-outlined text-[14px]">account_tree</span>
-                Account Split
+                {t("providerUtilizationAccountSplit")}
               </button>
             </div>
             <TimeRangeSelector value={range} onChange={setRange} />
@@ -230,13 +220,15 @@ export default function ProviderUtilizationTab() {
             <span className="material-symbols-outlined mr-2 animate-spin text-[18px]">
               progress_activity
             </span>
-            Loading utilization data…
+            {t("providerUtilizationLoading")}
           </div>
         ) : error ? (
           <div className="flex min-h-80 flex-col items-center justify-center gap-4 text-center">
             <span className="material-symbols-outlined text-[32px] text-error">error</span>
             <div className="flex flex-col gap-1">
-              <p className="text-sm font-medium text-text-main">Failed to load utilization data</p>
+              <p className="text-sm font-medium text-text-main">
+                {t("providerUtilizationFailedToLoad")}
+              </p>
               <p className="text-sm text-text-muted">{error}</p>
             </div>
             <button
@@ -250,12 +242,12 @@ export default function ProviderUtilizationTab() {
                   <span className="material-symbols-outlined animate-spin text-[18px]">
                     progress_activity
                   </span>
-                  Retrying…
+                  {t("retrying")}
                 </>
               ) : (
                 <>
                   <span className="material-symbols-outlined text-[18px]">refresh</span>
-                  Retry
+                  {t("retry")}
                 </>
               )}
             </button>
@@ -266,95 +258,54 @@ export default function ProviderUtilizationTab() {
               timeline
             </span>
             <div className="flex flex-col gap-2">
-              <p className="text-sm font-medium text-text-main">No utilization data available</p>
+              <p className="text-sm font-medium text-text-main">{t("providerUtilizationNoData")}</p>
               <p className="max-w-md text-sm text-text-muted">
-                Provider quota snapshots will appear here after utilization data is collected.
+                {t("providerUtilizationNoDataDescription")}
               </p>
             </div>
             <div className="rounded-lg border border-black/5 bg-black/[0.02] p-4 dark:border-white/5 dark:bg-white/[0.02]">
-              <p className="text-xs font-medium text-text-main">Getting started</p>
+              <p className="text-xs font-medium text-text-main">
+                {t("providerUtilizationGettingStarted")}
+              </p>
               <ul className="mt-2 text-left text-xs text-text-muted">
                 <li className="flex items-start gap-2">
                   <span className="material-symbols-outlined text-[14px] text-primary">
                     check_circle
                   </span>
                   <span>
-                    Connect providers via OAuth or API keys in <strong>Providers</strong>
+                    {t.rich("providerUtilizationStepConnect", {
+                      strong: (chunks) => <strong>{chunks}</strong>,
+                    })}
                   </span>
                 </li>
                 <li className="mt-1 flex items-start gap-2">
                   <span className="material-symbols-outlined text-[14px] text-primary">
                     check_circle
                   </span>
-                  <span>
-                    Enable quota tracking by using the provider in a combo or direct request
-                  </span>
+                  <span>{t("providerUtilizationStepEnable")}</span>
                 </li>
                 <li className="mt-1 flex items-start gap-2">
                   <span className="material-symbols-outlined text-[14px] text-primary">
                     check_circle
                   </span>
-                  <span>Data will appear automatically as quota snapshots are collected</span>
+                  <span>{t("providerUtilizationStepAutomatic")}</span>
                 </li>
               </ul>
             </div>
           </div>
         ) : (
           <div className="flex flex-col gap-5">
-            <div className="h-80 w-full rounded-xl border border-black/5 bg-black/[0.02] px-3 py-4 dark:border-white/5 dark:bg-white/[0.02]">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={chartData} margin={{ top: 8, right: 16, bottom: 0, left: 0 }}>
-                  <CartesianGrid
-                    stroke="var(--color-border)"
-                    strokeDasharray="3 3"
-                    vertical={false}
-                  />
-                  <XAxis
-                    dataKey="timestamp"
-                    tickFormatter={(value) => formatTimestamp(String(value), range)}
-                    tick={{ fill: "var(--color-text-muted)", fontSize: 12 }}
-                    axisLine={{ stroke: "var(--color-border)" }}
-                    tickLine={{ stroke: "var(--color-border)" }}
-                    minTickGap={24}
-                  />
-                  <YAxis
-                    domain={[0, 100]}
-                    tickFormatter={formatPercent}
-                    tick={{ fill: "var(--color-text-muted)", fontSize: 12 }}
-                    axisLine={{ stroke: "var(--color-border)" }}
-                    tickLine={{ stroke: "var(--color-border)" }}
-                    width={44}
-                  />
-                  <Tooltip
-                    labelFormatter={(value) => formatTooltipTimestamp(String(value), range)}
-                    formatter={(value: number, name: string) => [formatPercent(value), name]}
-                    contentStyle={{
-                      backgroundColor: "var(--color-surface)",
-                      borderColor: "var(--color-border)",
-                      borderRadius: 12,
-                      color: "var(--color-text-main)",
-                      boxShadow: "var(--shadow-soft)",
-                    }}
-                    itemStyle={{ color: "var(--color-text-main)" }}
-                    labelStyle={{ color: "var(--color-text-main)", fontWeight: 600 }}
-                  />
-                  <Legend />
-                  {data?.providers.map((provider) => (
-                    <Line
-                      key={provider}
-                      type="monotone"
-                      dataKey={provider}
-                      name={provider}
-                      stroke={providerColors.get(provider) ?? "var(--color-primary)"}
-                      strokeWidth={2.5}
-                      dot={false}
-                      activeDot={{ r: 4, strokeWidth: 0 }}
-                      connectNulls
-                    />
-                  ))}
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
+            <ProviderCharts
+              chartData={chartData}
+              providers={data?.providers ?? []}
+              providerColors={providerColors}
+              range={range}
+              resolveProviderName={resolveProviderName}
+              nodeMap={nodeMap}
+              formatTimestamp={formatTimestamp}
+              formatPercent={formatPercent}
+              formatTooltipTimestamp={formatTooltipTimestamp}
+            />
 
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
               {latestPoints.map((point) => {
@@ -368,8 +319,12 @@ export default function ProviderUtilizationTab() {
                           <ProviderIcon providerId={point.provider} size={22} />
                         </div>
                         <div>
-                          <p className="text-sm font-semibold text-text-main">{point.provider}</p>
-                          <p className="text-xs text-text-muted">Latest quota snapshot</p>
+                          <p className="text-sm font-semibold text-text-main">
+                            {resolveProviderName(point.provider, nodeMap)}
+                          </p>
+                          <p className="text-xs text-text-muted">
+                            {t("providerUtilizationLatestSnapshot")}
+                          </p>
                         </div>
                       </div>
                       <span
@@ -381,7 +336,11 @@ export default function ProviderUtilizationTab() {
                               : "bg-success/10 text-success"
                         }`}
                       >
-                        {point.isExhausted ? "Exhausted" : isLow ? "Low" : "Healthy"}
+                        {point.isExhausted
+                          ? t("statusExhausted")
+                          : isLow
+                            ? t("statusLow")
+                            : t("statusHealthy")}
                       </span>
                     </div>
 
@@ -390,7 +349,9 @@ export default function ProviderUtilizationTab() {
                         <p className="text-3xl font-bold text-text-main">
                           {point.remainingPct.toFixed(point.remainingPct < 10 ? 1 : 0)}%
                         </p>
-                        <p className="mt-1 text-xs text-text-muted">Remaining capacity</p>
+                        <p className="mt-1 text-xs text-text-muted">
+                          {t("providerUtilizationRemainingCapacity")}
+                        </p>
                       </div>
                       <div className="text-right text-xs text-text-muted">
                         <p>{formatTooltipTimestamp(point.timestamp, range)}</p>
@@ -409,7 +370,7 @@ export default function ProviderUtilizationTab() {
                       </div>
                       <div className="flex items-center justify-between text-xs text-text-muted">
                         <span>0%</span>
-                        <span>Remaining quota</span>
+                        <span>{t("remainingQuota")}</span>
                         <span>100%</span>
                       </div>
                     </div>

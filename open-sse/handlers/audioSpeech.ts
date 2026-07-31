@@ -1,5 +1,5 @@
-import { randomUUID } from "crypto";
-import { getCorsOrigin } from "../utils/cors.ts";
+import { CORS_HEADERS } from "../utils/cors.ts";
+import { stripTrailingSlashes } from "../utils/urlSanitize.ts";
 /**
  * Audio Speech Handler (TTS)
  *
@@ -19,53 +19,102 @@ import { getCorsOrigin } from "../utils/cors.ts";
 
 import { getSpeechProvider, parseSpeechModel } from "../config/audioRegistry.ts";
 import { buildAuthHeaders } from "../config/registryUtils.ts";
+import { kieExecutor } from "../executors/kie.ts";
+import { vertexGenerateSpeech } from "../executors/vertexMedia.ts";
+import { handleAwsPollySpeech } from "../executors/awsPollyTts.ts";
+import { handleEdgeTtsSpeech } from "../executors/edgeTts.ts";
+import { GttsUpstreamError, normalizeGttsLang, synthesizeGtts } from "../executors/gtts.ts";
 import { errorResponse } from "../utils/error.ts";
+import { audioStreamResponse, upstreamErrorResponse } from "../utils/audioResponse.ts";
+import {
+  getKieCallbackUrl,
+  getKieErrorMessage,
+  getKieErrorStatus,
+  isJsonObject,
+  parseKieResultJson,
+} from "../utils/kieTask.ts";
 
-/**
- * Return a CORS error response from an upstream fetch failure
- */
-function upstreamErrorResponse(res, errText) {
-  // Always return JSON so the client can detect 401/credential errors reliably
-  let errorMessage: string;
-  try {
-    const parsed = JSON.parse(errText);
-    // Extract a human-readable message from various error response shapes.
-    // Guard against `parsed.error` being an object (e.g. ElevenLabs returns
-    // { error: { message: "...", status_code: 401 } } or { detail: { ... } })
-    const raw =
-      parsed?.err_msg ||
-      parsed?.error?.message ||
-      (typeof parsed?.error === "string" ? parsed.error : null) ||
-      parsed?.message ||
-      (typeof parsed?.detail === "string" ? parsed.detail : parsed?.detail?.message) ||
-      null;
-    errorMessage = raw ? String(raw) : errText || `Upstream error (${res.status})`;
-  } catch {
-    errorMessage = errText || `Upstream error (${res.status})`;
-  }
-
-  return Response.json(
-    { error: { message: errorMessage, code: res.status } },
-    {
-      status: res.status,
-      headers: { "Access-Control-Allow-Origin": getCorsOrigin() },
-    }
-  );
+function normalizeKieElevenLabsVoice(voice: unknown): string {
+  const value = typeof voice === "string" ? voice.trim() : "";
+  const aliases: Record<string, string> = {
+    alloy: "Rachel",
+    echo: "Adam",
+    fable: "Brian",
+    onyx: "Antoni",
+    nova: "Bella",
+    shimmer: "Dorothy",
+  };
+  return aliases[value.toLowerCase()] || value || "Rachel";
 }
 
-/**
- * Return a CORS audio stream response
- */
-function audioStreamResponse(res, defaultContentType = "audio/mpeg") {
-  const contentType = res.headers.get("content-type") || defaultContentType;
-  return new Response(res.body, {
-    status: 200,
-    headers: {
-      "Content-Type": contentType,
-      "Access-Control-Allow-Origin": getCorsOrigin(),
-      "Transfer-Encoding": "chunked",
-    },
-  });
+function findAudioUrlDeep(value: unknown): string | null {
+  if (!value) return null;
+
+  if (typeof value === "string") {
+    if (/^https?:\/\//i.test(value) && !/\.(jpg|jpeg|png|webp|gif|svg)(\?|$)/i.test(value)) {
+      return value;
+    }
+    return null;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const url = findAudioUrlDeep(item);
+      if (url) return url;
+    }
+    return null;
+  }
+
+  if (isJsonObject(value)) {
+    const preferredKeys = [
+      "audio_url",
+      "audioUrl",
+      "stream_audio_url",
+      "streamAudioUrl",
+      "resultUrl",
+      "url",
+      "downloadUrl",
+      "resultUrls",
+    ];
+
+    for (const key of preferredKeys) {
+      const url = findAudioUrlDeep(value[key]);
+      if (url) return url;
+    }
+
+    for (const item of Object.values(value)) {
+      const url = findAudioUrlDeep(item);
+      if (url) return url;
+    }
+  }
+
+  return null;
+}
+
+function findKieAudioUrl(recordData: unknown): string | null {
+  const record = isJsonObject(recordData) ? recordData : {};
+  const data = isJsonObject(record.data) ? record.data : {};
+  const resultJson = parseKieResultJson(recordData);
+  const response = data.response;
+  const nestedData = data.data;
+  const candidates = [
+    response,
+    data,
+    resultJson,
+    ...(Array.isArray(response) ? response : []),
+    ...(Array.isArray(nestedData) ? nestedData : []),
+    ...(Array.isArray(resultJson.data) ? resultJson.data : []),
+    ...(Array.isArray(resultJson.result) ? resultJson.result : []),
+  ];
+
+  for (const item of candidates) {
+    const url = findAudioUrlDeep(item);
+    if (url) {
+      return url;
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -74,6 +123,57 @@ function audioStreamResponse(res, defaultContentType = "audio/mpeg") {
  */
 function isValidPathSegment(segment: string): boolean {
   return !segment.includes("..") && !segment.includes("//");
+}
+
+function getStringValue(value): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function getProviderSpecificData(credentials) {
+  return credentials?.providerSpecificData &&
+    typeof credentials.providerSpecificData === "object" &&
+    !Array.isArray(credentials.providerSpecificData)
+    ? credentials.providerSpecificData
+    : {};
+}
+
+function normalizeXiaomiMimoSpeechUrl(baseUrl) {
+  const configured = getStringValue(baseUrl) || "https://api.xiaomimimo.com/v1";
+  const normalized = stripTrailingSlashes(configured).replace(/\/chat\/completions$/i, "");
+  return `${normalized}/chat/completions`;
+}
+
+function normalizeXiaomiMimoMimeType(format) {
+  switch (getStringValue(format)?.toLowerCase()) {
+    case undefined:
+    case null:
+    case "mp3":
+    case "audio/mp3":
+    case "audio/mpeg":
+      return "audio/mpeg";
+    case "wav":
+    case "audio/wav":
+      return "audio/wav";
+    default:
+      return null;
+  }
+}
+
+function getXiaomiMimoAudioData(data) {
+  const messageAudio = data?.choices?.[0]?.message?.audio;
+  const directAudio = data?.audio || data?.output_audio;
+  const firstDataItem = Array.isArray(data?.data) ? data.data[0] : null;
+
+  return (
+    getStringValue(messageAudio?.data) ||
+    getStringValue(messageAudio?.b64_json) ||
+    getStringValue(directAudio?.data) ||
+    getStringValue(directAudio?.b64_json) ||
+    getStringValue(firstDataItem?.b64_json) ||
+    getStringValue(firstDataItem?.audio) ||
+    getStringValue(data?.audioContent) ||
+    getStringValue(data?.audio_content)
+  );
 }
 
 /**
@@ -101,7 +201,6 @@ async function handleHyperbolicSpeech(providerConfig, body, token) {
     status: 200,
     headers: {
       "Content-Type": "audio/mpeg",
-      "Access-Control-Allow-Origin": getCorsOrigin(),
     },
   });
 }
@@ -217,7 +316,21 @@ async function handleHuggingFaceTtsSpeech(providerConfig, body, modelId, token) 
  * POST { text, voiceId, modelId, audioConfig } → JSON { audioContent: "<base64>" }
  * Docs: https://docs.inworld.ai/api-reference/ttsAPI/texttospeech/synthesize-speech
  */
+const INWORLD_AUDIO_FORMATS = {
+  mp3: { audioEncoding: "MP3", mimeType: "audio/mpeg" },
+  wav: { audioEncoding: "WAV", mimeType: "audio/wav" },
+  opus: { audioEncoding: "OPUS", mimeType: "audio/opus" },
+  pcm: { audioEncoding: "PCM", mimeType: "audio/pcm" },
+};
+
 async function handleInworldSpeech(providerConfig, body, modelId, token) {
+  const requestedFormat =
+    typeof body.response_format === "string" ? body.response_format.toLowerCase() : "mp3";
+  const audioFormat = INWORLD_AUDIO_FORMATS[requestedFormat];
+  if (!audioFormat) {
+    return errorResponse(400, "Inworld TTS supports response_format mp3, wav, opus, or pcm only");
+  }
+
   const res = await fetch(providerConfig.baseUrl, {
     method: "POST",
     headers: {
@@ -229,7 +342,7 @@ async function handleInworldSpeech(providerConfig, body, modelId, token) {
       voiceId: body.voice || undefined,
       modelId,
       audioConfig: {
-        audioEncoding: body.response_format === "wav" ? "LINEAR16" : "MP3",
+        audioEncoding: audioFormat.audioEncoding,
       },
     }),
   });
@@ -241,13 +354,15 @@ async function handleInworldSpeech(providerConfig, body, modelId, token) {
   const data = await res.json();
   // Decode base64 audioContent to binary
   const audioBuffer = Uint8Array.from(atob(data.audioContent ?? ""), (c) => c.charCodeAt(0));
-  const mimeType = body.response_format === "wav" ? "audio/wav" : "audio/mpeg";
+  const mimeType =
+    typeof data.contentType === "string" && data.contentType
+      ? data.contentType
+      : audioFormat.mimeType;
 
   return new Response(audioBuffer, {
     status: 200,
     headers: {
       "Content-Type": mimeType,
-      "Access-Control-Allow-Origin": getCorsOrigin(),
     },
   });
 }
@@ -275,6 +390,35 @@ async function handleCartesiaSpeech(providerConfig, body, modelId, token) {
       transcript: body.input,
       ...(body.voice ? { voice: { mode: "id", id: body.voice } } : {}),
       output_format: outputFormat,
+    }),
+  });
+
+  if (!res.ok) {
+    return upstreamErrorResponse(res, await res.text());
+  }
+
+  return audioStreamResponse(res);
+}
+
+/**
+ * Handle Fish Audio TTS
+ * POST { text, format, reference_id, prosody } → binary audio bytes
+ * Auth: Authorization: Bearer <api-key>, model as an HTTP header
+ * Docs: https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech
+ */
+async function handleFishAudioSpeech(providerConfig, body, modelId, token) {
+  const res = await fetch(providerConfig.baseUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+      model: modelId,
+    },
+    body: JSON.stringify({
+      text: body.input,
+      format: body.response_format || "mp3",
+      ...(body.voice ? { reference_id: body.voice } : {}),
+      ...(body.speed ? { prosody: { speed: body.speed } } : {}),
     }),
   });
 
@@ -322,6 +466,242 @@ async function handlePlayHtSpeech(providerConfig, body, modelId, token) {
 }
 
 /**
+ * Handle Kie.ai TTS
+ * Kie.ai has model-specific endpoints or uses unified jobs API.
+ */
+async function handleKieAudioSpeech(providerConfig, body, modelId, token) {
+  const baseUrl = providerConfig.baseUrl.replace(/\/$/, "");
+  const voice = normalizeKieElevenLabsVoice(body.voice);
+
+  const payload = {
+    model: modelId,
+    callBackUrl: getKieCallbackUrl(body),
+    input: {
+      text: body.input,
+      voice,
+      stability: typeof body.stability === "number" ? body.stability : 0.5,
+      similarity_boost: typeof body.similarity_boost === "number" ? body.similarity_boost : 0.75,
+      style: typeof body.style === "number" ? body.style : 0,
+      speed: typeof body.speed === "number" ? body.speed : 1,
+      timestamps: body.timestamps === true,
+      previous_text: body.previous_text || "",
+      next_text: body.next_text || "",
+      language_code: body.language_code || "",
+    },
+  };
+
+  let data;
+  try {
+    data = await kieExecutor.createTask({
+      baseUrl,
+      token,
+      payload,
+    });
+  } catch (err: unknown) {
+    const status = getKieErrorStatus(err, 502);
+    return Response.json(
+      {
+        error: { message: getKieErrorMessage(err, "Kie audio createTask failed"), code: status },
+      },
+      {
+        status,
+        headers: { ...CORS_HEADERS },
+      }
+    );
+  }
+
+  const taskId = data?.data?.taskId || data?.taskId;
+  if (taskId) {
+    return pollKieAudioResult(baseUrl, modelId, taskId, token);
+  }
+
+  const audioUrl = findKieAudioUrl(data);
+  if (typeof audioUrl === "string" && audioUrl.length > 0) {
+    const audioRes = await fetch(audioUrl);
+    return audioStreamResponse(audioRes);
+  }
+
+  return errorResponse(
+    502,
+    data?.msg || data?.message || "Kie audio generation did not return taskId or audio URL"
+  );
+}
+
+/**
+ * Internal polling for Kie.ai async audio tasks
+ */
+async function pollKieAudioResult(baseUrl, modelId, taskId, token) {
+  void modelId;
+  const statusUrl = kieExecutor.getTaskStatusUrl(baseUrl);
+  try {
+    const { data, state } = await kieExecutor.pollTask({
+      statusUrl,
+      taskId: String(taskId),
+      token,
+      timeoutMs: 60000,
+      pollIntervalMs: 2000,
+    });
+
+    if (state === "success") {
+      const url = findKieAudioUrl(data);
+      if (url) {
+        const audioRes = await fetch(url);
+        return audioStreamResponse(audioRes);
+      }
+      return errorResponse(502, "Kie audio task completed without audio URL");
+    }
+  } catch (err: unknown) {
+    return errorResponse(
+      getKieErrorStatus(err, 504),
+      getKieErrorMessage(err, "Kie audio generation timed out or failed")
+    );
+  }
+
+  return errorResponse(504, "Kie audio generation timed out or failed");
+}
+
+/**
+ * Xiaomi MiMo TTS uses chat/completions with an audio config instead of OpenAI's /audio/speech
+ * request body.
+ */
+async function handleXiaomiMimoSpeech(providerConfig, body, modelId, token, credentials) {
+  const providerSpecificData = getProviderSpecificData(credentials);
+  const url = normalizeXiaomiMimoSpeechUrl(providerSpecificData.baseUrl || providerConfig.baseUrl);
+  const audioMimeType = normalizeXiaomiMimoMimeType(body.response_format);
+  if (!audioMimeType) {
+    return errorResponse(400, "Xiaomi MiMo TTS supports response_format mp3 or wav only");
+  }
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...buildAuthHeaders(providerConfig, token),
+    },
+    body: JSON.stringify({
+      model: modelId,
+      messages: [{ role: "assistant", content: body.input }],
+      audio: {
+        format: audioMimeType,
+        voice: body.voice || getStringValue(providerSpecificData.defaultVoice) || "mimo_default",
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    return upstreamErrorResponse(res, await res.text());
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+  if (contentType.startsWith("audio/")) {
+    return audioStreamResponse(res, audioMimeType);
+  }
+
+  const data = await res.json();
+  const audioBase64 = getXiaomiMimoAudioData(data);
+  if (!audioBase64) {
+    return errorResponse(502, "Xiaomi MiMo TTS response did not contain audio data");
+  }
+
+  const audioBuffer = Uint8Array.from(atob(audioBase64), (c) => c.charCodeAt(0));
+  return new Response(audioBuffer, {
+    status: 200,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": audioMimeType,
+    },
+  });
+}
+
+/**
+ * MiniMax T2A v2 — POST returns hex-encoded audio in a JSON envelope guarded by
+ * `base_resp.status_code` (0 = success).
+ * Port of decolua/9router#1043 by toanalien <toanalien@gmail.com>.
+ */
+function hexToBytes(audioHex) {
+  const clean = typeof audioHex === "string" ? audioHex.trim() : "";
+  if (!clean) throw new Error("MiniMax TTS returned no audio");
+  if (clean.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(clean)) {
+    throw new Error("MiniMax TTS returned invalid audio");
+  }
+  const len = clean.length / 2;
+  const out = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    out[i] = parseInt(clean.substr(i * 2, 2), 16);
+  }
+  return out;
+}
+
+async function handleMinimaxSpeech(providerConfig, body, modelId, token) {
+  const voiceId = (typeof body.voice === "string" && body.voice) || "English_expressive_narrator";
+  const res = await fetch(providerConfig.baseUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...buildAuthHeaders(providerConfig, token),
+    },
+    body: JSON.stringify({
+      model: modelId || "speech-2.8-hd",
+      text: body.input,
+      stream: false,
+      language_boost: "auto",
+      output_format: "hex",
+      voice_setting: {
+        voice_id: voiceId,
+        speed: typeof body.speed === "number" ? body.speed : 1,
+        vol: 1,
+        pitch: 0,
+      },
+      audio_setting: {
+        sample_rate: 32000,
+        bitrate: 128000,
+        format: "mp3",
+        channel: 1,
+      },
+    }),
+  });
+
+  const rawText = await res.text();
+  let data: Record<string, unknown> = {};
+  if (rawText) {
+    try {
+      const parsed = JSON.parse(rawText);
+      if (parsed && typeof parsed === "object") data = parsed as Record<string, unknown>;
+    } catch {
+      data = {};
+    }
+  }
+
+  if (!res.ok) {
+    return upstreamErrorResponse(res, rawText);
+  }
+
+  const baseResp = ((data.base_resp || data.baseResp) as Record<string, unknown> | undefined) || {};
+  const statusCode = Number(baseResp.status_code ?? baseResp.statusCode ?? 0);
+  const statusMessage = String(baseResp.status_msg || baseResp.statusMsg || data.message || "");
+  if (statusCode !== 0) {
+    return errorResponse(502, `MiniMax TTS: ${statusMessage || "upstream error"}`);
+  }
+
+  const audioField = (data.data as Record<string, unknown> | undefined)?.audio;
+  let bytes: Uint8Array;
+  try {
+    bytes = hexToBytes(audioField);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "invalid audio";
+    return errorResponse(502, `MiniMax TTS: ${msg}`);
+  }
+
+  return new Response(bytes, {
+    status: 200,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": "audio/mpeg",
+    },
+  });
+}
+
+/**
  * Handle Coqui TTS (local, no auth)
  * POST {baseUrl} with { text, speaker_id } → WAV audio
  */
@@ -344,7 +724,6 @@ async function handleCoquiSpeech(providerConfig, body) {
     status: 200,
     headers: {
       "Content-Type": contentType,
-      "Access-Control-Allow-Origin": getCorsOrigin(),
     },
   });
 }
@@ -372,9 +751,30 @@ async function handleTortoiseSpeech(providerConfig, body) {
     status: 200,
     headers: {
       "Content-Type": contentType,
-      "Access-Control-Allow-Origin": getCorsOrigin(),
     },
   });
+}
+
+/**
+ * Handle gTTS TTS (local no-auth, Google Translate batchexecute RPC).
+ * `voice` doubles as the language code since gTTS has no voice concept —
+ * defaults to English when omitted or unrecognized.
+ */
+async function handleGttsSpeech(body) {
+  try {
+    const audio = await synthesizeGtts({
+      text: body.input,
+      lang: normalizeGttsLang(body.voice),
+    });
+    return new Response(audio, {
+      status: 200,
+      headers: { ...CORS_HEADERS, "Content-Type": "audio/mpeg" },
+    });
+  } catch (err) {
+    const status = err instanceof GttsUpstreamError ? err.status : 502;
+    const message = err instanceof Error ? err.message : "gTTS synthesis failed";
+    return errorResponse(status, message);
+  }
 }
 
 /**
@@ -391,6 +791,7 @@ export async function handleAudioSpeech({
   credentials,
   resolvedProvider = null,
   resolvedModel = null,
+  clientIp = null,
 }) {
   if (!body.model) {
     return errorResponse(400, "model is required");
@@ -412,7 +813,7 @@ export async function handleAudioSpeech({
   if (!providerConfig) {
     return errorResponse(
       400,
-      `No speech provider found for model "${body.model}". Use format provider/model. Available: openai, hyperbolic, deepgram, nvidia, elevenlabs, huggingface, inworld, cartesia, playht, coqui, tortoise, qwen`
+      `No speech provider found for model "${body.model}". Use format provider/model. Available: openai, hyperbolic, deepgram, nvidia, elevenlabs, huggingface, inworld, cartesia, fishaudio, playht, kie, aws-polly, xiaomi-mimo, edgetts, gtts, coqui, tortoise, qwen`
     );
   }
 
@@ -425,6 +826,18 @@ export async function handleAudioSpeech({
 
   try {
     // Route to provider-specific handler
+    if (providerConfig.format === "vertex-gemini-tts") {
+      const { audio, contentType } = await vertexGenerateSpeech(credentials, {
+        model: modelId,
+        input: body.input,
+        voice: body.voice,
+      });
+      return new Response(audio, {
+        status: 200,
+        headers: { ...CORS_HEADERS, "Content-Type": contentType },
+      });
+    }
+
     if (providerConfig.format === "hyperbolic") {
       return handleHyperbolicSpeech(providerConfig, body, token);
     }
@@ -453,8 +866,36 @@ export async function handleAudioSpeech({
       return handleCartesiaSpeech(providerConfig, body, modelId, token);
     }
 
+    if (providerConfig.format === "fishaudio") {
+      return handleFishAudioSpeech(providerConfig, body, modelId, token);
+    }
+
     if (providerConfig.format === "playht") {
       return handlePlayHtSpeech(providerConfig, body, modelId, token);
+    }
+
+    if (providerConfig.format === "kie-audio") {
+      return handleKieAudioSpeech(providerConfig, body, modelId, token);
+    }
+
+    if (providerConfig.format === "aws-polly") {
+      return handleAwsPollySpeech(providerConfig, body, modelId, token, credentials);
+    }
+
+    if (providerConfig.format === "edgetts") {
+      return handleEdgeTtsSpeech(body, clientIp);
+    }
+
+    if (providerConfig.format === "gtts") {
+      return handleGttsSpeech(body);
+    }
+
+    if (providerConfig.format === "xiaomi-mimo-tts") {
+      return handleXiaomiMimoSpeech(providerConfig, body, modelId, token, credentials);
+    }
+
+    if (providerConfig.format === "minimax-tts") {
+      return handleMinimaxSpeech(providerConfig, body, modelId, token);
     }
 
     if (providerConfig.format === "coqui") {

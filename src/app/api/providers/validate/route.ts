@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance/index";
 import { getProviderNodeById } from "@/models";
 import {
   isClaudeCodeCompatibleProvider,
@@ -6,13 +8,27 @@ import {
   isAnthropicCompatibleProvider,
 } from "@/shared/constants/providers";
 import { validateProviderApiKey } from "@/lib/providers/validation";
-import { getProxyForLevel } from "@/lib/localDb";
+import { getProxyForLevel, resolveProxyForProvider } from "@/lib/localDb";
 import { validateProviderApiKeySchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
+import { runWithProxyContextOrDirect } from "@omniroute/open-sse/utils/proxyFetch.ts";
+
+function sanitizeAuditUrl(url: string | null | undefined) {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`.replace(/\/$/, "") || parsed.origin;
+  } catch {
+    return String(url);
+  }
+}
 
 // POST /api/providers/validate - Validate API key with provider
 export async function POST(request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
+  const auditContext = getAuditRequestContext(request);
   let rawBody;
   try {
     rawBody = await request.json();
@@ -39,6 +55,8 @@ export async function POST(request) {
       validationModelId,
       customUserAgent,
       baseUrl: bodyBaseUrl,
+      region,
+      cx,
     } = validation.data;
 
     let providerSpecificData: any = { validationModelId };
@@ -47,6 +65,12 @@ export async function POST(request) {
     }
     if (bodyBaseUrl) {
       providerSpecificData.baseUrl = bodyBaseUrl;
+    }
+    if (region) {
+      providerSpecificData.region = region;
+    }
+    if (cx) {
+      providerSpecificData.cx = cx;
     }
 
     if (isOpenAICompatibleProvider(provider) || isAnthropicCompatibleProvider(provider)) {
@@ -71,10 +95,16 @@ export async function POST(request) {
       };
     }
 
-    const providerProxy = await getProxyForLevel("provider", provider);
-    const globalProxy = providerProxy ? null : await getProxyForLevel("global");
+    const registryProxy = await resolveProxyForProvider(provider);
+    let proxyToUse = registryProxy;
 
-    const result = await runWithProxyContext(providerProxy || globalProxy || null, () =>
+    if (!proxyToUse) {
+      const providerProxy = await getProxyForLevel("provider", provider);
+      const globalProxy = providerProxy ? null : await getProxyForLevel("global");
+      proxyToUse = providerProxy || globalProxy || null;
+    }
+
+    const result = await runWithProxyContextOrDirect(proxyToUse || null, () =>
       validateProviderApiKey({
         provider,
         apiKey,
@@ -83,7 +113,37 @@ export async function POST(request) {
     );
 
     if (result.unsupported) {
-      return NextResponse.json({ error: "Provider validation not supported" }, { status: 400 });
+      // #5565/#5567: surface `unsupported` so the dashboard can treat "validation
+      // not supported" as a non-blocking warning (allow Save) instead of a hard
+      // "Invalid" block — providers like lmarena / piapi have no live validator.
+      return NextResponse.json(
+        { error: "Provider validation not supported", unsupported: true },
+        { status: 400 }
+      );
+    }
+
+    if (!result.valid && typeof result.statusCode === "number") {
+      if (result.securityBlocked) {
+        logAuditEvent({
+          action: "provider.validation.ssrf_blocked",
+          actor: "admin",
+          target: provider,
+          resourceType: "provider_validation",
+          status: "blocked",
+          ipAddress: auditContext.ipAddress || undefined,
+          requestId: auditContext.requestId,
+          metadata: {
+            provider,
+            route: "/api/providers/validate",
+            reason: result.error || "Blocked provider validation target",
+            baseUrl: sanitizeAuditUrl(bodyBaseUrl || providerSpecificData?.baseUrl),
+          },
+        });
+      }
+      return NextResponse.json(
+        { error: result.error || "Validation failed" },
+        { status: result.statusCode }
+      );
     }
 
     return NextResponse.json({

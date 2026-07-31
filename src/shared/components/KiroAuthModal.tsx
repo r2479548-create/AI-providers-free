@@ -1,24 +1,50 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import PropTypes from "prop-types";
 import Modal from "./Modal";
 import Button from "./Button";
 import Input from "./Input";
+
+type KiroAuthModalProps = {
+  isOpen: boolean;
+  providerId?: string;
+  providerLabel?: string;
+  onMethodSelect: (method: string, config?: Record<string, unknown>) => void;
+  onClose: () => void;
+};
 
 /**
  * Kiro Auth Method Selection Modal
  * Auto-detects token from AWS SSO cache or allows manual import
  */
-export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
+export default function KiroAuthModal({
+  isOpen,
+  providerId = "kiro",
+  providerLabel = "Kiro",
+  onMethodSelect,
+  onClose,
+}: KiroAuthModalProps) {
   const [selectedMethod, setSelectedMethod] = useState(null);
   const [idcStartUrl, setIdcStartUrl] = useState("");
   const [idcRegion, setIdcRegion] = useState("us-east-1");
   const [refreshToken, setRefreshToken] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [apiKeyRegion, setApiKeyRegion] = useState("us-east-1");
   const [error, setError] = useState(null);
   const [importing, setImporting] = useState(false);
+  const [importingApiKey, setImportingApiKey] = useState(false);
   const [autoDetecting, setAutoDetecting] = useState(false);
-  const [autoDetected, setAutoDetected] = useState(false);
+
+  useEffect(() => {
+    if (isOpen) return;
+    setSelectedMethod(null);
+    setIdcStartUrl("");
+    setIdcRegion("us-east-1");
+    setRefreshToken("");
+    setApiKey("");
+    setApiKeyRegion("us-east-1");
+    setError(null);
+  }, [isOpen]);
 
   // Auto-detect token when import method is selected
   useEffect(() => {
@@ -27,15 +53,17 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
     const autoDetect = async () => {
       setAutoDetecting(true);
       setError(null);
-      setAutoDetected(false);
 
       try {
-        const res = await fetch("/api/oauth/kiro/auto-import");
+        const res = await fetch(
+          `/api/oauth/kiro/auto-import?targetProvider=${encodeURIComponent(providerId)}`
+        );
         const data = await res.json();
 
         if (data.found) {
-          setRefreshToken(data.refreshToken);
-          setAutoDetected(true);
+          onMethodSelect("import");
+          onClose();
+          return;
         } else {
           setError(data.error || "Could not auto-detect token");
         }
@@ -47,7 +75,7 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
     };
 
     autoDetect();
-  }, [selectedMethod, isOpen]);
+  }, [providerId, selectedMethod, isOpen, onMethodSelect, onClose]);
 
   const handleMethodSelect = (method) => {
     setSelectedMethod(method);
@@ -69,11 +97,16 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
     setError(null);
 
     try {
-      const res = await fetch("/api/oauth/kiro/import", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refreshToken: refreshToken.trim() }),
-      });
+      const res = await fetch(
+        `/api/oauth/kiro/import?targetProvider=${encodeURIComponent(providerId)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            refreshToken: refreshToken.trim(),
+          }),
+        }
+      );
 
       const data = await res.json();
 
@@ -82,11 +115,49 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
       }
 
       // Success - close modal
+      onMethodSelect("import");
       onClose();
     } catch (err) {
-      setError(err.message);
+      setError(err instanceof Error ? err.message : "Import failed");
     } finally {
       setImporting(false);
+    }
+  };
+
+  const handleImportApiKey = async () => {
+    if (!apiKey.trim()) {
+      setError("Please enter a Kiro API key");
+      return;
+    }
+
+    setImportingApiKey(true);
+    setError(null);
+
+    try {
+      const res = await fetch(
+        `/api/oauth/kiro/api-key?targetProvider=${encodeURIComponent(providerId)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            apiKey: apiKey.trim(),
+            region: apiKeyRegion.trim() || "us-east-1",
+          }),
+        }
+      );
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error?.message || data.error || "API key import failed");
+      }
+
+      onMethodSelect("api-key");
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "API key import failed");
+    } finally {
+      setImportingApiKey(false);
     }
   };
 
@@ -103,7 +174,7 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
   };
 
   return (
-    <Modal isOpen={isOpen} title="Connect Kiro" onClose={onClose} size="lg">
+    <Modal isOpen={isOpen} title={`Connect ${providerLabel}`} onClose={onClose} size="lg">
       <div className="flex flex-col gap-4">
         {/* Method Selection */}
         {!selectedMethod && (
@@ -120,32 +191,35 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
                 <div className="flex-1">
                   <h3 className="font-semibold mb-1">AWS Builder ID</h3>
                   <p className="text-sm text-text-muted">
-                    Recommended for most users. Free AWS account required.
+                    Recommended for most users. Sign in with the AWS account linked to{" "}
+                    {providerLabel}.
                   </p>
                 </div>
               </div>
             </button>
 
-            {/* AWS IAM Identity Center (IDC) - HIDDEN */}
+            {/* AWS IAM Identity Center (IDC) */}
             <button
               onClick={() => handleMethodSelect("idc")}
-              className="hidden w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
+              className="w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
             >
               <div className="flex items-start gap-3">
                 <span className="material-symbols-outlined text-primary mt-0.5">business</span>
                 <div className="flex-1">
-                  <h3 className="font-semibold mb-1">AWS IAM Identity Center</h3>
+                  <h3 className="font-semibold mb-1">
+                    Your Organization (AWS IAM Identity Center)
+                  </h3>
                   <p className="text-sm text-text-muted">
-                    For enterprise users with custom AWS IAM Identity Center.
+                    Use your company SSO start URL (example: https://your-org.awsapps.com/start).
                   </p>
                 </div>
               </div>
             </button>
 
-            {/* Google Social Login - HIDDEN */}
+            {/* Google Social Login */}
             <button
-              onClick={() => handleMethodSelect("social-google")}
-              className="hidden w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
+              onClick={() => handleSocialLogin("google")}
+              className="w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
             >
               <div className="flex items-start gap-3">
                 <span className="material-symbols-outlined text-primary mt-0.5">
@@ -153,25 +227,21 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
                 </span>
                 <div className="flex-1">
                   <h3 className="font-semibold mb-1">Google Account</h3>
-                  <p className="text-sm text-text-muted">
-                    Login with your Google account (manual callback).
-                  </p>
+                  <p className="text-sm text-text-muted">Login with your Google account.</p>
                 </div>
               </div>
             </button>
 
-            {/* GitHub Social Login - HIDDEN */}
+            {/* GitHub Social Login */}
             <button
-              onClick={() => handleMethodSelect("social-github")}
-              className="hidden w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
+              onClick={() => handleSocialLogin("github")}
+              className="w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
             >
               <div className="flex items-start gap-3">
                 <span className="material-symbols-outlined text-primary mt-0.5">code</span>
                 <div className="flex-1">
                   <h3 className="font-semibold mb-1">GitHub Account</h3>
-                  <p className="text-sm text-text-muted">
-                    Login with your GitHub account (manual callback).
-                  </p>
+                  <p className="text-sm text-text-muted">Login with your GitHub account.</p>
                 </div>
               </div>
             </button>
@@ -185,7 +255,26 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
                 <span className="material-symbols-outlined text-primary mt-0.5">file_upload</span>
                 <div className="flex-1">
                   <h3 className="font-semibold mb-1">Import Token</h3>
-                  <p className="text-sm text-text-muted">Paste refresh token from Kiro IDE.</p>
+                  <p className="text-sm text-text-muted">
+                    Paste a refresh token exported from {providerLabel}.
+                  </p>
+                </div>
+              </div>
+            </button>
+
+            {/* API Key */}
+            <button
+              onClick={() => handleMethodSelect("api-key")}
+              className="w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
+            >
+              <div className="flex items-start gap-3">
+                <span className="material-symbols-outlined text-primary mt-0.5">key</span>
+                <div className="flex-1">
+                  <h3 className="font-semibold mb-1">API Key</h3>
+                  <p className="text-sm text-text-muted">
+                    Paste a long-lived {providerLabel} / CodeWhisperer API key. It is stored as a
+                    bearer credential with no refresh token; profile discovery is best-effort.
+                  </p>
                 </div>
               </div>
             </button>
@@ -236,68 +325,6 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
           </div>
         )}
 
-        {/* Social Login Info (Google) */}
-        {selectedMethod === "social-google" && (
-          <div className="space-y-4">
-            <div className="bg-amber-50 dark:bg-amber-900/20 p-4 rounded-lg border border-amber-200 dark:border-amber-800">
-              <div className="flex gap-2">
-                <span className="material-symbols-outlined text-amber-600 dark:text-amber-400">
-                  info
-                </span>
-                <div className="flex-1 text-sm">
-                  <p className="font-medium text-amber-900 dark:text-amber-100 mb-1">
-                    Manual Callback Required
-                  </p>
-                  <p className="text-amber-800 dark:text-amber-200">
-                    After login, you&apos;ll need to copy the callback URL from your browser and
-                    paste it back here.
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            <div className="flex gap-2">
-              <Button onClick={() => handleSocialLogin("google")} fullWidth>
-                Continue with Google
-              </Button>
-              <Button onClick={handleBack} variant="ghost" fullWidth>
-                Back
-              </Button>
-            </div>
-          </div>
-        )}
-
-        {/* Social Login Info (GitHub) */}
-        {selectedMethod === "social-github" && (
-          <div className="space-y-4">
-            <div className="bg-amber-50 dark:bg-amber-900/20 p-4 rounded-lg border border-amber-200 dark:border-amber-800">
-              <div className="flex gap-2">
-                <span className="material-symbols-outlined text-amber-600 dark:text-amber-400">
-                  info
-                </span>
-                <div className="flex-1 text-sm">
-                  <p className="font-medium text-amber-900 dark:text-amber-100 mb-1">
-                    Manual Callback Required
-                  </p>
-                  <p className="text-amber-800 dark:text-amber-200">
-                    After login, you&apos;ll need to copy the callback URL from your browser and
-                    paste it back here.
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            <div className="flex gap-2">
-              <Button onClick={() => handleSocialLogin("github")} fullWidth>
-                Continue with GitHub
-              </Button>
-              <Button onClick={handleBack} variant="ghost" fullWidth>
-                Back
-              </Button>
-            </div>
-          </div>
-        )}
-
         {/* Import Token */}
         {selectedMethod === "import" && (
           <div className="space-y-4">
@@ -310,36 +337,25 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
                   </span>
                 </div>
                 <h3 className="text-lg font-semibold mb-2">Auto-detecting token...</h3>
-                <p className="text-sm text-text-muted">Reading from AWS SSO cache</p>
+                <p className="text-sm text-text-muted">
+                  Reading {providerLabel} credentials from AWS SSO cache
+                </p>
               </div>
             )}
 
             {/* Form (shown after auto-detect completes) */}
             {!autoDetecting && (
               <>
-                {/* Success message if auto-detected */}
-                {autoDetected && (
-                  <div className="bg-green-50 dark:bg-green-900/20 p-3 rounded-lg border border-green-200 dark:border-green-800">
-                    <div className="flex gap-2">
-                      <span className="material-symbols-outlined text-green-600 dark:text-green-400">
-                        check_circle
-                      </span>
-                      <p className="text-sm text-green-800 dark:text-green-200">
-                        Token auto-detected from Kiro IDE successfully!
-                      </p>
-                    </div>
-                  </div>
-                )}
-
                 {/* Info message if not auto-detected */}
-                {!autoDetected && !error && (
+                {!error && (
                   <div className="bg-blue-50 dark:bg-blue-900/20 p-3 rounded-lg border border-blue-200 dark:border-blue-800">
                     <div className="flex gap-2">
                       <span className="material-symbols-outlined text-blue-600 dark:text-blue-400">
                         info
                       </span>
                       <p className="text-sm text-blue-800 dark:text-blue-200">
-                        Kiro IDE not detected. Please paste your refresh token manually.
+                        {providerLabel} token was not auto-detected. Please paste your refresh token
+                        manually.
                       </p>
                     </div>
                   </div>
@@ -350,6 +366,7 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
                     Refresh Token <span className="text-red-500">*</span>
                   </label>
                   <Input
+                    type="password"
                     value={refreshToken}
                     onChange={(e) => setRefreshToken(e.target.value)}
                     placeholder="Token will be auto-filled..."
@@ -379,13 +396,60 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
             )}
           </div>
         )}
+
+        {/* API Key Import */}
+        {selectedMethod === "api-key" && (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium mb-2">
+                API Key <span className="text-red-500">*</span>
+              </label>
+              <Input
+                type="password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder={`Paste your ${providerLabel} API key...`}
+                className="font-mono text-sm"
+              />
+              <p className="text-xs text-text-muted mt-1">
+                Stored encrypted as a long-lived bearer credential. There is no refresh flow.
+              </p>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-2">AWS Region</label>
+              <Input
+                value={apiKeyRegion}
+                onChange={(e) => setApiKeyRegion(e.target.value)}
+                placeholder="us-east-1"
+                className="font-mono text-sm"
+              />
+              <p className="text-xs text-text-muted mt-1">
+                AWS region for the key (default: us-east-1)
+              </p>
+            </div>
+
+            {error && (
+              <div className="bg-red-50 dark:bg-red-900/20 p-3 rounded-lg border border-red-200 dark:border-red-800">
+                <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+              </div>
+            )}
+
+            <div className="flex gap-2">
+              <Button
+                onClick={handleImportApiKey}
+                fullWidth
+                disabled={importingApiKey || !apiKey.trim()}
+              >
+                {importingApiKey ? "Validating..." : "Validate and Save API Key"}
+              </Button>
+              <Button onClick={handleBack} variant="ghost" fullWidth>
+                Back
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
     </Modal>
   );
 }
-
-KiroAuthModal.propTypes = {
-  isOpen: PropTypes.bool.isRequired,
-  onMethodSelect: PropTypes.func.isRequired,
-  onClose: PropTypes.func.isRequired,
-};

@@ -1,4 +1,11 @@
 import { FORMATS } from "../translator/formats.ts";
+import {
+  buildGeminiThoughtSignatureKey,
+  storeGeminiThoughtSignature,
+} from "../services/geminiThoughtSignatureStore.ts";
+import { normalizeOpenAICompatibleFinishReasonString } from "../utils/finishReason.ts";
+import { containsTextualToolCallMarker } from "../utils/textualToolCall.ts";
+import { getAnyReasoningValue } from "../utils/reasoningFields.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -18,6 +25,57 @@ function toNumber(value: unknown, fallback = 0): number {
         ? Number(value)
         : Number.NaN;
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function firstPositiveNumber(...values: unknown[]): number {
+  for (const value of values) {
+    const parsed = toNumber(value, 0);
+    if (parsed > 0) {
+      return parsed;
+    }
+  }
+  return 0;
+}
+
+function normalizeToolCallArgs(args: unknown): unknown {
+  if (typeof args !== "string") return args;
+  const trimmed = args.trim();
+  if (!trimmed || !(trimmed.startsWith("{") || trimmed.startsWith("["))) return args;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return args;
+  }
+}
+
+function parseTextualToolCall(text: unknown): { name: string; args: unknown } | null {
+  if (typeof text !== "string") return null;
+
+  // Gemini/Antigravity sometimes imitates the request-side fallback with small
+  // variations, e.g. a leading "(empty)" marker or zero-width chars inserted
+  // into argument strings. Normalize those variants before parsing so the
+  // response is still surfaced as a structured OpenAI tool call.
+  const normalized = text.replace(/[\u200B-\u200D\uFEFF]/g, "");
+  const match = normalized.match(
+    /^[\s\S]*?\[Tool call:\s*([^\]\n]+)\]\s*\nArguments:\s*([\s\S]+?)\s*$/
+  );
+  if (!match) return null;
+  const name = match[1]?.trim();
+  const rawArgs = match[2]?.trim();
+  if (!name || !rawArgs) return null;
+  try {
+    let args = JSON.parse(rawArgs);
+    if (typeof args === "string") {
+      const trimmed = args.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        args = JSON.parse(trimmed);
+      }
+    }
+    if (args && typeof args === "object" && !Array.isArray(args)) {
+      return { name, args };
+    }
+  } catch {}
+  return null;
 }
 
 function extractMessageOutputText(item: JsonRecord): string {
@@ -123,10 +181,17 @@ export function translateNonStreamingResponse(
           toString(itemObj.call_id) ||
           toString(itemObj.id) ||
           `call_${Date.now()}_${toolCalls.length}`;
+        let argsToEmit = itemObj.arguments;
+        if (argsToEmit != null && typeof argsToEmit === "object" && !Array.isArray(argsToEmit)) {
+          const cleaned: JsonRecord = { ...(argsToEmit as JsonRecord) };
+          for (const [k, v] of Object.entries(cleaned)) {
+            if (v === "" || (Array.isArray(v) && v.length === 0)) delete cleaned[k];
+          }
+          argsToEmit = cleaned;
+        }
+
         const fnArgs =
-          typeof itemObj.arguments === "string"
-            ? itemObj.arguments
-            : JSON.stringify(itemObj.arguments || {});
+          typeof argsToEmit === "string" ? argsToEmit : JSON.stringify(argsToEmit || {});
         const rawName = toString(itemObj.name);
         // Strip Claude OAuth proxy_ prefix using toolNameMap
         const resolvedName = toolNameMap?.get(rawName) ?? rawName;
@@ -188,28 +253,45 @@ export function translateNonStreamingResponse(
     if (Object.keys(usage).length > 0) {
       const inputTokens = toNumber(usage.input_tokens, 0);
       const outputTokens = toNumber(usage.output_tokens, 0);
+      const inputTokensDetails = toRecord(usage.input_tokens_details);
+      const outputTokensDetails = toRecord(usage.output_tokens_details);
+      const promptTokensDetails = toRecord(usage.prompt_tokens_details);
+      const completionTokensDetails = toRecord(usage.completion_tokens_details);
+      const cachedInputTokens = firstPositiveNumber(
+        inputTokensDetails.cached_tokens,
+        promptTokensDetails.cached_tokens,
+        usage.cache_read_input_tokens
+      );
+      const cacheCreationInputTokens = firstPositiveNumber(
+        inputTokensDetails.cache_creation_tokens,
+        promptTokensDetails.cache_creation_tokens,
+        usage.cache_creation_input_tokens
+      );
+      const reasoningTokens = firstPositiveNumber(
+        outputTokensDetails.reasoning_tokens,
+        completionTokensDetails.reasoning_tokens,
+        usage.reasoning_tokens
+      );
+
       result.usage = {
         prompt_tokens: inputTokens,
         completion_tokens: outputTokens,
         total_tokens: inputTokens + outputTokens,
       };
 
-      if (toNumber(usage.reasoning_tokens, 0) > 0) {
+      if (reasoningTokens > 0) {
         (result.usage as JsonRecord).completion_tokens_details = {
-          reasoning_tokens: toNumber(usage.reasoning_tokens, 0),
+          reasoning_tokens: reasoningTokens,
         };
       }
-      if (
-        toNumber(usage.cache_read_input_tokens, 0) > 0 ||
-        toNumber(usage.cache_creation_input_tokens, 0) > 0
-      ) {
+      if (cachedInputTokens > 0 || cacheCreationInputTokens > 0) {
         (result.usage as JsonRecord).prompt_tokens_details = {};
         const promptDetails = (result.usage as JsonRecord).prompt_tokens_details as JsonRecord;
-        if (toNumber(usage.cache_read_input_tokens, 0) > 0) {
-          promptDetails.cached_tokens = toNumber(usage.cache_read_input_tokens, 0);
+        if (cachedInputTokens > 0) {
+          promptDetails.cached_tokens = cachedInputTokens;
         }
-        if (toNumber(usage.cache_creation_input_tokens, 0) > 0) {
-          promptDetails.cache_creation_tokens = toNumber(usage.cache_creation_input_tokens, 0);
+        if (cacheCreationInputTokens > 0) {
+          promptDetails.cache_creation_tokens = cacheCreationInputTokens;
         }
       }
     }
@@ -218,11 +300,7 @@ export function translateNonStreamingResponse(
   }
 
   // Handle Gemini/Antigravity format
-  else if (
-    targetFormat === FORMATS.GEMINI ||
-    targetFormat === FORMATS.ANTIGRAVITY ||
-    targetFormat === FORMATS.GEMINI_CLI
-  ) {
+  else if (targetFormat === FORMATS.GEMINI || targetFormat === FORMATS.ANTIGRAVITY) {
     const root = toRecord(responseBody);
     const response = toRecord(root.response ?? root);
     const candidates = Array.isArray(response.candidates) ? response.candidates : [];
@@ -244,6 +322,7 @@ export function translateNonStreamingResponse(
               const contentParts: JsonRecord[] = [];
               const toolCalls: JsonRecord[] = [];
               let reasoningContent = "";
+              let pendingThoughtSignature = "";
 
               if (Array.isArray(content.parts)) {
                 for (const part of content.parts) {
@@ -253,9 +332,31 @@ export function translateNonStreamingResponse(
                     continue;
                   }
 
+                  // Capture thoughtSignature from thinking parts (Gemini thinking models)
+                  // so it can be stored alongside any subsequent functionCall part.
+                  const partThoughtSig = toString(
+                    partObj.thoughtSignature ?? partObj.thought_signature
+                  );
+                  if (partThoughtSig) {
+                    pendingThoughtSignature = partThoughtSig;
+                  }
+
                   if (typeof partObj.text === "string") {
-                    textContent += partObj.text;
-                    contentParts.push({ type: "text", text: partObj.text });
+                    const textualToolCall = parseTextualToolCall(partObj.text);
+                    if (textualToolCall) {
+                      const toolCallId = `call_${toString(textualToolCall.name, "unknown")}_${Date.now()}_${toolCalls.length}`;
+                      toolCalls.push({
+                        id: toolCallId,
+                        type: "function",
+                        function: {
+                          name: textualToolCall.name,
+                          arguments: JSON.stringify(textualToolCall.args || {}),
+                        },
+                      });
+                    } else if (!containsTextualToolCallMarker(partObj.text)) {
+                      textContent += partObj.text;
+                      contentParts.push({ type: "text", text: partObj.text });
+                    }
                   }
 
                   const inlineData = toRecord(partObj.inlineData ?? partObj.inline_data);
@@ -272,12 +373,30 @@ export function translateNonStreamingResponse(
 
                   if (partObj.functionCall) {
                     const fn = toRecord(partObj.functionCall);
+                    const rawName = toString(fn.name);
+                    const restoredName = toolNameMap?.get(rawName) ?? rawName;
+                    const nativeId = toString(fn.id);
+                    const toolCallId =
+                      nativeId.length > 0
+                        ? nativeId
+                        : `call_${toString(restoredName, "unknown")}_${Date.now()}_${toolCalls.length}`;
+
+                    // Persist the thought signature so openai-to-gemini can
+                    // resolve it on the next turn. Use the part-level field
+                    // (part.thoughtSignature) and fall back to any signature
+                    // captured from an earlier thinking-only part.
+                    const sig = partThoughtSig || pendingThoughtSignature;
+                    if (sig) {
+                      const sigKey = buildGeminiThoughtSignatureKey(null, toolCallId);
+                      storeGeminiThoughtSignature(sigKey, sig);
+                    }
+
                     toolCalls.push({
-                      id: `call_${toString(fn.name, "unknown")}_${Date.now()}_${toolCalls.length}`,
+                      id: toolCallId,
                       type: "function",
                       function: {
-                        name: toString(fn.name),
-                        arguments: JSON.stringify(fn.args || {}),
+                        name: restoredName,
+                        arguments: JSON.stringify(normalizeToolCallArgs(fn.args || {})),
                       },
                     });
                   }
@@ -302,16 +421,10 @@ export function translateNonStreamingResponse(
                 message.content = "";
               }
 
-              let finishReason = toString(candidate.finishReason, "stop").toLowerCase();
-              if (finishReason === "max_tokens") {
-                finishReason = "length";
-              } else if (
-                finishReason === "safety" ||
-                finishReason === "recitation" ||
-                finishReason === "blocklist"
-              ) {
-                finishReason = "content_filter";
-              } else if (finishReason === "stop" && toolCalls.length > 0) {
+              let finishReason = normalizeOpenAICompatibleFinishReasonString(
+                toString(candidate.finishReason, "stop")
+              );
+              if (finishReason === "stop" && toolCalls.length > 0) {
                 finishReason = "tool_calls";
               }
 
@@ -444,8 +557,35 @@ export function translateNonStreamingResponse(
     return convertOpenAINonStreamingToClaude(toRecord(intermediateOpenAI));
   }
 
+  // Gemini-family clients (Gemini, Antigravity): the streaming SSE path already
+  // projects OpenAI chunks into the `{ response: { candidates: [...] } }` envelope
+  // via the registered FORMATS.OPENAI -> FORMATS.ANTIGRAVITY translator
+  // (translator/response/openai-to-antigravity.ts), but this non-streaming path had
+  // no equivalent back-conversion step — it silently returned the raw OpenAI
+  // chat.completion shape (leaking `choices[]`/`tool_calls` instead of
+  // `candidates[]`/`functionCall`) to any non-streaming Gemini/Antigravity client.
+  if (
+    (sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.ANTIGRAVITY) &&
+    sourceFormat !== targetFormat
+  ) {
+    return convertOpenAINonStreamingToGeminiFamily(toRecord(intermediateOpenAI));
+  }
+
   // Return intermediateOpenAI (which is either the raw response if unknown targetFormat, or an OpenAI compatible payload)
   return intermediateOpenAI;
+}
+
+/**
+ * Resolve reasoning/thinking text off a non-streaming OpenAI-format message object.
+ * Delegates to the shared reasoning-field resolver (`open-sse/utils/reasoningFields.ts`)
+ * so every reasoning alias — DeepSeek-style `reasoning_content`, the OpenRouter/StepFun
+ * `reasoning` string, GitHub Copilot's `reasoning_text`, `thinking`/`thought`, and
+ * `reasoning_details[]` (array of { text | content }) — is read from one place instead
+ * of a divergent local copy. Mirrors the streaming translator's fallback chain in
+ * open-sse/translator/response/openai-to-claude.ts.
+ */
+function resolveReasoningText(messageObj: JsonRecord): string {
+  return getAnyReasoningValue(messageObj);
 }
 
 /**
@@ -466,11 +606,12 @@ function convertOpenAINonStreamingToClaude(openaiResponse: JsonRecord): JsonReco
 
   let hasTextOrReasoning = false;
 
-  if (messageObj.reasoning_content) {
+  const reasoningText = resolveReasoningText(messageObj);
+  if (reasoningText) {
     hasTextOrReasoning = true;
     content.push({
       type: "thinking",
-      thinking: toString(messageObj.reasoning_content),
+      thinking: reasoningText,
     });
   }
 
@@ -525,4 +666,93 @@ function convertOpenAINonStreamingToClaude(openaiResponse: JsonRecord): JsonReco
   };
 
   return claudeResponse;
+}
+
+const OPENAI_TO_GEMINI_FINISH_REASON: Record<string, string> = {
+  stop: "STOP",
+  length: "MAX_TOKENS",
+  tool_calls: "STOP",
+  content_filter: "SAFETY",
+};
+
+/**
+ * Parse an OpenAI tool-call `arguments` payload into a Gemini `functionCall.args`
+ * object. Never throws: a provider emitting malformed/truncated JSON must not take
+ * down the whole non-streaming response path, so an unparseable payload degrades to
+ * `{}` (matching the streaming Gemini translator's behaviour).
+ */
+function parseFunctionCallArgs(args: unknown): Record<string, unknown> {
+  if (typeof args !== "string") return toRecord(args);
+  try {
+    return toRecord(JSON.parse(args || "{}"));
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Helper to convert an OpenAI chat.completion JSON object into the Gemini/Antigravity
+ * `{ response: { candidates: [...] } }` envelope for non-streaming clients. Mirrors the
+ * shape already produced for streaming by the registered
+ * FORMATS.OPENAI -> FORMATS.ANTIGRAVITY translator
+ * (translator/response/openai-to-antigravity.ts) so both paths agree.
+ */
+function convertOpenAINonStreamingToGeminiFamily(openaiResponse: JsonRecord): JsonRecord {
+  const choices = openaiResponse.choices as unknown[] | undefined;
+  const isChoicesArray = Array.isArray(choices);
+  if (!isChoicesArray && openaiResponse.object !== "chat.completion") {
+    return openaiResponse; // If it doesn't look like OpenAI, return as-is
+  }
+
+  const choice = isChoicesArray ? toRecord(choices[0]) : {};
+  const messageObj = toRecord(choice.message);
+
+  const parts: JsonRecord[] = [];
+  const reasoningText = resolveReasoningText(messageObj);
+  if (reasoningText) {
+    parts.push({ text: reasoningText, thought: true });
+  }
+  if (typeof messageObj.content === "string" && messageObj.content.length > 0) {
+    parts.push({ text: messageObj.content });
+  }
+  const toolCalls = Array.isArray(messageObj.tool_calls) ? messageObj.tool_calls : [];
+  for (const toolCall of toolCalls) {
+    const toolObj = toRecord(toolCall);
+    const fn = toRecord(toolObj.function);
+    parts.push({
+      functionCall: {
+        name: toString(fn.name),
+        args: parseFunctionCallArgs(fn.arguments),
+      },
+    });
+  }
+  if (parts.length === 0) parts.push({ text: "" });
+
+  const finishReason =
+    OPENAI_TO_GEMINI_FINISH_REASON[toString(choice.finish_reason, "stop")] ?? "STOP";
+
+  const usageSrc = toRecord(openaiResponse.usage);
+  const promptTokens = toNumber(usageSrc.prompt_tokens, 0);
+  const completionTokens = toNumber(usageSrc.completion_tokens, 0);
+
+  const geminiResponse: JsonRecord = {
+    response: {
+      candidates: [
+        {
+          content: { role: "model", parts },
+          finishReason,
+          index: 0,
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: promptTokens,
+        candidatesTokenCount: completionTokens,
+        totalTokenCount: toNumber(usageSrc.total_tokens, promptTokens + completionTokens),
+      },
+      modelVersion: toString(openaiResponse.model, "unknown"),
+      responseId: toString(openaiResponse.id, `resp_${Date.now()}`),
+    },
+  };
+
+  return geminiResponse;
 }

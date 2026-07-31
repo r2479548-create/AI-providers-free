@@ -3,9 +3,11 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
+import { useDisplayBaseUrl } from "@/shared/hooks";
+import { TierTour } from "./steps/TierTour";
 
-const STEP_IDS = ["welcome", "security", "provider", "test", "done"];
-const STEP_ICONS = ["waving_hand", "lock", "dns", "play_circle", "check_circle"];
+const STEP_IDS = ["welcome", "tiers", "security", "provider", "test", "done"];
+const STEP_ICONS = ["waving_hand", "layers", "lock", "dns", "play_circle", "check_circle"];
 
 const COMMON_PROVIDERS = [
   { id: "openai", name: "OpenAI", color: "#10A37F" },
@@ -20,14 +22,16 @@ export default function OnboardingWizard() {
   const router = useRouter();
   const t = useTranslations("onboarding");
   const tc = useTranslations("common");
+  const baseUrl = useDisplayBaseUrl();
   const [step, setStep] = useState(0);
   const [loading, setLoading] = useState(true);
-  const [apiEndpoint, setApiEndpoint] = useState("http://localhost:20128/api/v1");
+  const apiEndpoint = `${baseUrl}/api/v1`;
 
   // Security step state
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [skipSecurity, setSkipSecurity] = useState(false);
+  const [capsLockOn, setCapsLockOn] = useState(false);
 
   // Provider step state
   const [selectedProvider, setSelectedProvider] = useState(null);
@@ -41,20 +45,11 @@ export default function OnboardingWizard() {
 
   // Check if setup is already complete
   useEffect(() => {
-    const resolveApiEndpoint = (apiPort) => {
-      if (typeof window === "undefined") return;
-      const protocol = window.location.protocol;
-      const hostname = window.location.hostname;
-      const effectiveApiPort = apiPort || 20128;
-      setApiEndpoint(`${protocol}//${hostname}:${effectiveApiPort}/api/v1`);
-    };
-
     const checkSetup = async () => {
       try {
         const res = await fetch("/api/settings");
         if (res.ok) {
           const settings = await res.json();
-          resolveApiEndpoint(settings?.apiPort);
           if (settings.setupComplete) {
             router.replace("/dashboard");
             return;
@@ -111,6 +106,16 @@ export default function OnboardingWizard() {
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         setErrorMessage(data.error || t("failedSetPassword"));
+        return;
+      }
+      const loginRes = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
+      });
+      if (!loginRes.ok) {
+        const data = await loginRes.json().catch(() => ({}));
+        setErrorMessage(data.error || t("connectionError"));
         return;
       }
       handleNext();
@@ -210,14 +215,14 @@ export default function OnboardingWizard() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-bg">
+      <div className="min-h-screen flex items-center justify-center">
         <div className="animate-pulse text-text-muted">{tc("loading")}</div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-bg p-4">
+    <div className="min-h-screen flex items-center justify-center p-4">
       <div className="w-full max-w-lg">
         {/* Progress Indicator */}
         <div className="flex items-center justify-center gap-2 mb-8">
@@ -260,7 +265,12 @@ export default function OnboardingWizard() {
             >
               {currentStep.icon}
             </span>
-            <h2 className="text-2xl font-bold text-text-main mb-1">{currentStep.title}</h2>
+            <h2 className="text-2xl font-bold text-text-main">{currentStep.title}</h2>
+            {currentStep.id === "tiers" && (
+              <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-text-muted text-balance">
+                {t("tier.subtitle")}
+              </p>
+            )}
           </div>
 
           {/* Step Content */}
@@ -269,7 +279,7 @@ export default function OnboardingWizard() {
             {currentStep.id === "welcome" && (
               <div className="text-center space-y-4">
                 <p className="text-text-muted">{t("welcomeDesc")}</p>
-                <div className="grid grid-cols-3 gap-3 mt-6">
+                <div className="mt-6 grid grid-cols-3 gap-3 items-stretch">
                   {[
                     { icon: "swap_horiz", label: t("multiProvider") },
                     { icon: "monitoring", label: t("usageTracking") },
@@ -277,17 +287,22 @@ export default function OnboardingWizard() {
                   ].map((f) => (
                     <div
                       key={f.icon}
-                      className="bg-white/[0.03] rounded-xl p-3 text-center border border-white/[0.06]"
+                      className="h-full bg-white/[0.03] rounded-xl p-3 text-center border border-white/[0.06]"
                     >
-                      <span className="material-symbols-outlined text-primary text-[24px] mb-1 block">
-                        {f.icon}
-                      </span>
-                      <span className="text-xs text-text-muted">{f.label}</span>
+                      <div className="flex h-full flex-col items-center justify-center">
+                        <span className="material-symbols-outlined text-primary text-[24px] mb-1 block">
+                          {f.icon}
+                        </span>
+                        <span className="text-xs text-text-muted">{f.label}</span>
+                      </div>
                     </div>
                   ))}
                 </div>
               </div>
             )}
+
+            {/* Tiers */}
+            {currentStep.id === "tiers" && <TierTour />}
 
             {/* Security */}
             {currentStep.id === "security" && (
@@ -309,6 +324,8 @@ export default function OnboardingWizard() {
                       placeholder={t("enterPassword")}
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
+                      onKeyDown={(e) => setCapsLockOn(e.getModifierState("CapsLock"))}
+                      onKeyUp={(e) => setCapsLockOn(e.getModifierState("CapsLock"))}
                       className="w-full px-4 py-2.5 bg-white/[0.04] border border-white/10 rounded-lg text-text-main text-sm placeholder:text-text-muted/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
                     />
                     <input
@@ -316,8 +333,18 @@ export default function OnboardingWizard() {
                       placeholder={t("confirmPasswordPlaceholder")}
                       value={confirmPassword}
                       onChange={(e) => setConfirmPassword(e.target.value)}
+                      onKeyDown={(e) => setCapsLockOn(e.getModifierState("CapsLock"))}
+                      onKeyUp={(e) => setCapsLockOn(e.getModifierState("CapsLock"))}
                       className="w-full px-4 py-2.5 bg-white/[0.04] border border-white/10 rounded-lg text-text-main text-sm placeholder:text-text-muted/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
                     />
+                    {capsLockOn && (
+                      <p className="text-xs text-amber-500 dark:text-amber-400 flex items-center gap-1 animate-in fade-in duration-200">
+                        <span className="material-symbols-outlined text-[14px]" aria-hidden="true">
+                          keyboard_capslock
+                        </span>
+                        Caps Lock is on
+                      </p>
+                    )}
                     {password && confirmPassword && password !== confirmPassword && (
                       <p className="text-xs text-red-400">{t("passwordsMismatch")}</p>
                     )}
@@ -451,6 +478,14 @@ export default function OnboardingWizard() {
                   className="px-6 py-2.5 bg-primary rounded-lg text-white font-medium text-sm hover:bg-primary/90 transition-colors cursor-pointer"
                 >
                   {t("getStarted")}
+                </button>
+              )}
+              {currentStep.id === "tiers" && (
+                <button
+                  onClick={handleNext}
+                  className="px-6 py-2.5 bg-primary rounded-lg text-white font-medium text-sm hover:bg-primary/90 transition-colors cursor-pointer"
+                >
+                  {t("continue")}
                 </button>
               )}
               {currentStep.id === "security" && (

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import Button from "@/shared/components/Button";
 import Card from "@/shared/components/Card";
 import { useNotificationStore } from "@/store/notificationStore";
@@ -8,9 +8,9 @@ import {
   FACTOR_LABELS,
   MODE_PACK_OPTIONS,
   buildIntelligentProviderScores,
-  extractIntelligentHealthState,
   normalizeIntelligentRoutingConfig,
 } from "@/lib/combos/intelligentRouting";
+import { AI_PROVIDERS } from "@/shared/constants/providers";
 
 function getI18nOrFallback(t: any, key: string, fallback: string) {
   if (typeof t?.has === "function" && t.has(key)) return t(key);
@@ -18,18 +18,31 @@ function getI18nOrFallback(t: any, key: string, fallback: string) {
 }
 
 function formatProviderLabel(providerId: string, activeProviders: any[] = []) {
-  const matchedConnection = activeProviders.find(
-    (provider) =>
-      provider?.provider === providerId ||
-      provider?.id === providerId ||
-      provider?.name === providerId
+  const matchedProvider = activeProviders.find(
+    (provider) => provider?.providerId === providerId || provider?.provider === providerId
   );
 
-  if (matchedConnection?.name && matchedConnection.name !== providerId) {
-    return `${matchedConnection.name} (${providerId})`;
+  if (typeof matchedProvider?.displayName === "string" && matchedProvider.displayName.trim()) {
+    return matchedProvider.displayName.trim();
   }
 
-  return providerId;
+  return (AI_PROVIDERS as Record<string, any>)[providerId]?.name || providerId;
+}
+
+function countProvidersInScope(activeProviders: any[] = []) {
+  const providerIds = new Set<string>();
+
+  for (const provider of activeProviders) {
+    const providerId =
+      typeof provider?.providerId === "string" && provider.providerId.trim().length > 0
+        ? provider.providerId.trim()
+        : typeof provider?.provider === "string" && provider.provider.trim().length > 0
+          ? provider.provider.trim()
+          : null;
+    if (providerId) providerIds.add(providerId);
+  }
+
+  return providerIds.size;
 }
 
 export default function IntelligentComboPanel({
@@ -46,43 +59,14 @@ export default function IntelligentComboPanel({
   onComboUpdated?: (combo: any) => void;
 }) {
   const notify = useNotificationStore();
-  const [incidentMode, setIncidentMode] = useState(false);
-  const [exclusions, setExclusions] = useState<any[]>([]);
   const [savingModePack, setSavingModePack] = useState<string | null>(null);
   const normalizedConfig = useMemo(
     () => normalizeIntelligentRoutingConfig(combo?.config),
     [combo?.config]
   );
   const providerScores = useMemo(() => buildIntelligentProviderScores(combo), [combo]);
-
-  const fetchHealth = useCallback(async () => {
-    try {
-      const response = await fetch("/api/monitoring/health");
-      if (!response.ok) {
-        setIncidentMode(false);
-        setExclusions([]);
-        return;
-      }
-
-      const health = await response.json();
-      const nextState = extractIntelligentHealthState(health);
-      setIncidentMode(nextState.incidentMode);
-      setExclusions(nextState.exclusions);
-    } catch {
-      setIncidentMode(false);
-      setExclusions([]);
-    }
-  }, []);
-
-  useEffect(() => {
-    const timeoutId = setTimeout(fetchHealth, 0);
-    const intervalId = setInterval(fetchHealth, 30_000);
-
-    return () => {
-      clearTimeout(timeoutId);
-      clearInterval(intervalId);
-    };
-  }, [fetchHealth]);
+  const providerScopeCount =
+    normalizedConfig.candidatePool.length || countProvidersInScope(activeProviders);
 
   const handleModePackChange = async (modePackId: string) => {
     if (!combo?.id || modePackId === normalizedConfig.modePack) return;
@@ -150,25 +134,13 @@ export default function IntelligentComboPanel({
                 {combo?.name}
               </code>
               <span>{allCombos.length} intelligent combo(s)</span>
-              <span>
-                {normalizedConfig.candidatePool.length || activeProviders.length} providers in scope
-              </span>
+              <span>{providerScopeCount} providers in scope</span>
             </div>
           </div>
 
-          <div
-            className={`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium ${
-              incidentMode
-                ? "bg-amber-500/15 text-amber-600 dark:text-amber-300"
-                : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-300"
-            }`}
-          >
-            <span className="material-symbols-outlined text-[14px]">
-              {incidentMode ? "warning" : "verified"}
-            </span>
-            {incidentMode
-              ? getI18nOrFallback(t, "incidentMode", "Incident Mode")
-              : getI18nOrFallback(t, "normalOperation", "Normal Operation")}
+          <div className="inline-flex items-center gap-2 rounded-full bg-blue-500/15 px-3 py-1.5 text-xs font-medium text-blue-600 dark:text-blue-300">
+            <span className="material-symbols-outlined text-[14px]">tune</span>
+            {getI18nOrFallback(t, "configOnlyStatus", "Configuration View")}
           </div>
         </div>
 
@@ -180,22 +152,18 @@ export default function IntelligentComboPanel({
                   {getI18nOrFallback(t, "statusOverview", "Status Overview")}
                 </p>
                 <p className="text-[11px] text-text-muted mt-1">
-                  {incidentMode
-                    ? getI18nOrFallback(
-                        t,
-                        "highCircuitBreakerRate",
-                        "High circuit breaker trip rate detected."
-                      )
-                    : getI18nOrFallback(
-                        t,
-                        "allProvidersHealthy",
-                        "Providers are reporting healthy routing conditions."
-                      )}
+                  {getI18nOrFallback(
+                    t,
+                    "configOnlyHint",
+                    "This panel shows routing inputs only. Live breaker state is available on the Health page."
+                  )}
                 </p>
               </div>
               <div className="rounded-lg bg-black/5 dark:bg-white/5 px-3 py-2 text-right">
-                <p className="text-[10px] uppercase tracking-wide text-text-muted">Exclusions</p>
-                <p className="text-lg font-semibold text-text-main">{exclusions.length}</p>
+                <p className="text-[10px] uppercase tracking-wide text-text-muted">
+                  Candidate Pool
+                </p>
+                <p className="text-lg font-semibold text-text-main">{providerScopeCount}</p>
               </div>
             </div>
           </Card.Section>
@@ -317,51 +285,35 @@ export default function IntelligentComboPanel({
             <div className="flex items-center justify-between gap-2">
               <div>
                 <p className="text-sm font-semibold text-text-main">
-                  {getI18nOrFallback(t, "excludedProviders", "Excluded Providers")}
+                  {getI18nOrFallback(t, "routingInputs", "Routing Inputs")}
                 </p>
                 <p className="text-[11px] text-text-muted mt-1">
                   {getI18nOrFallback(
                     t,
-                    "excludedProvidersHint",
-                    "Providers with an OPEN circuit breaker are temporarily excluded from routing."
+                    "routingInputsHint",
+                    "Mode pack and weighting stay here; breaker runtime state stays on the Health page."
                   )}
                 </p>
               </div>
             </div>
 
-            <div className="mt-3 flex flex-col gap-2">
-              {exclusions.length === 0 ? (
-                <div className="rounded-lg border border-dashed border-emerald-500/20 bg-emerald-500/5 p-3 text-[11px] text-emerald-700 dark:text-emerald-300">
-                  <div className="flex items-center gap-2">
-                    <span className="material-symbols-outlined text-[14px]">verified</span>
-                    {getI18nOrFallback(
-                      t,
-                      "noExcludedProviders",
-                      "No providers are currently excluded."
-                    )}
-                  </div>
-                </div>
-              ) : (
-                exclusions.map((exclusion) => (
-                  <div
-                    key={`${exclusion.provider}-${exclusion.excludedAt}`}
-                    className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3"
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <p className="text-xs font-semibold text-text-main">{exclusion.provider}</p>
-                        <p className="text-[11px] text-text-muted mt-1">{exclusion.reason}</p>
-                      </div>
-                      <span className="rounded-full bg-amber-500/15 px-2 py-1 text-[10px] font-semibold text-amber-700 dark:text-amber-300">
-                        {getI18nOrFallback(t, "cooldownMinutes", "Cooldown: {minutes}m").replace(
-                          "{minutes}",
-                          `${Math.ceil(exclusion.cooldownMs / 60000)}`
-                        )}
-                      </span>
-                    </div>
-                  </div>
-                ))
-              )}
+            <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <div className="rounded-lg border border-black/8 bg-white/60 p-3 dark:border-white/8 dark:bg-white/[0.03]">
+                <p className="text-[11px] uppercase tracking-wide text-text-muted">
+                  {t("modePack")}
+                </p>
+                <p className="mt-1 text-sm font-semibold text-text-main">
+                  {normalizedConfig.modePack}
+                </p>
+              </div>
+              <div className="rounded-lg border border-black/8 bg-white/60 p-3 dark:border-white/8 dark:bg-white/[0.03]">
+                <p className="text-[11px] uppercase tracking-wide text-text-muted">
+                  Exploration Rate
+                </p>
+                <p className="mt-1 text-sm font-semibold text-text-main">
+                  {Math.round(normalizedConfig.explorationRate * 100)}%
+                </p>
+              </div>
             </div>
           </Card.Section>
         </div>

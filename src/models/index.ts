@@ -1,12 +1,16 @@
 // Database Models - Export all from localDb
 export {
   getProviderConnections,
+  getProviderConnectionsCount,
   getProviderConnectionById,
   createProviderConnection,
   updateProviderConnection,
   deleteProviderConnection,
+  deleteProviderConnections,
   getProviderNodes,
+  getProviderNodesCount,
   getProviderNodeById,
+  resolveProviderNodeForConnection,
   createProviderNode,
   updateProviderNode,
   deleteProviderNode,
@@ -14,6 +18,7 @@ export {
   getModelAliases,
   setModelAlias,
   deleteModelAlias,
+  deleteModelAliasesForProvider,
   getMitmAlias,
   setMitmAliasAll,
   getApiKeys,
@@ -22,4 +27,5 @@ export {
   validateApiKey,
   isCloudEnabled,
   resolveProxyForProvider,
+  getHiddenModelsByProvider,
 } from "@/lib/localDb";

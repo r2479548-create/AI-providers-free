@@ -1,7 +1,9 @@
 /**
  * Semantic Cache — Phase 9.1
  *
- * Caches non-streaming LLM responses (temperature=0) to reduce cost and latency.
+ * Caches LLM responses (temperature=0) to reduce cost and latency.
+ * Supports both streaming and non-streaming requests: streaming responses
+ * are cached after assembly; cache hits always return JSON.
  * Two-tier: in-memory LRU (fast) + SQLite (persistent across restarts).
  *
  * Cache key = SHA-256(model + normalized messages + temperature + top_p)
@@ -94,8 +96,8 @@ let memoryCache: LRUCache | null = null;
 function getMemoryCache() {
   if (!memoryCache) {
     memoryCache = new LRUCache({
-      maxSize: parseInt(process.env.SEMANTIC_CACHE_MAX_SIZE || "100", 10),
-      maxBytes: parseInt(process.env.SEMANTIC_CACHE_MAX_BYTES || String(4 * 1024 * 1024), 10),
+      maxSize: parseInt(process.env.SEMANTIC_CACHE_MAX_SIZE || "50", 10),
+      maxBytes: parseInt(process.env.SEMANTIC_CACHE_MAX_BYTES || String(2 * 1024 * 1024), 10),
       defaultTTL: parseInt(process.env.SEMANTIC_CACHE_TTL_MS || "1800000", 10),
     });
     ensureCacheMetricsTable();
@@ -111,27 +113,55 @@ function getMemoryCache() {
  * @param {Array} messages - Normalized messages array
  * @param {number} temperature
  * @param {number} topP
+ * @param {string} [apiKeyId] - API key ID for per-key isolation (prevents cross-user cache hits)
  * @returns {string} hex signature
  */
-export function generateSignature(model, messages, temperature = 0, topP = 1) {
+export function generateSignature(
+  model,
+  conversation,
+  temperature = 0,
+  topP = 1,
+  apiKeyId?: string
+) {
   const payload = JSON.stringify({
     model,
-    messages: normalizeMessages(messages),
+    messages: normalizeConversation(conversation),
     temperature,
     top_p: topP,
   });
-  return crypto.createHash("sha256").update(payload).digest("hex");
+  const digest = crypto.createHash("sha256").update(payload).digest("hex");
+  // Per-key cache isolation (#3740) namespaces the signature with the apiKeyId as a
+  // PLAINTEXT prefix instead of folding it into the digest. The apiKeyId is an internal
+  // identifier used purely to namespace a deterministic cache key — not a stored
+  // credential — so it must never flow into a hash (a salted/slow password hash would
+  // also break the determinism the cache relies on). Keeping it out of the digest
+  // preserves isolation + determinism and avoids the false-positive
+  // CodeQL js/insufficient-password-hash on a cache signature.
+  return apiKeyId ? `${apiKeyId}.${digest}` : digest;
+}
+
+function stringifyForSignature(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 /**
- * Normalize messages for consistent hashing.
- * Strips metadata, keeps only role + content.
+ * Normalize conversation items for consistent hashing.
+ * Supports both Chat Completions `messages[]` and Responses API `input[]`.
  */
-function normalizeMessages(messages) {
-  if (!Array.isArray(messages)) return [];
-  return messages.map((m) => ({
-    role: m.role || "user",
-    content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+function normalizeConversation(conversation: unknown) {
+  if (typeof conversation === "string") {
+    return [{ role: "user", content: conversation }];
+  }
+  if (!Array.isArray(conversation)) return [];
+
+  return conversation.map((item: Record<string, unknown>) => ({
+    role: typeof item?.role === "string" && item.role.trim().length > 0 ? item.role : "user",
+    content: stringifyForSignature(item?.content),
   }));
 }
 
@@ -223,24 +253,6 @@ export function setCachedResponse(signature, model, response, tokensSaved = 0, t
   }
 }
 
-// ─── Maintenance ─────────────────
-
-/**
- * Remove expired entries from SQLite.
- * @returns {number} Number of entries removed
- */
-export function cleanExpiredEntries() {
-  try {
-    const db = getDbInstance();
-    const result = db
-      .prepare("DELETE FROM semantic_cache WHERE expires_at <= datetime('now')")
-      .run();
-    return result.changes;
-  } catch {
-    return 0;
-  }
-}
-
 /**
  * Invalidate cache entries by model name.
  * Useful when a model is updated/changed and cached responses are stale.
@@ -284,48 +296,6 @@ export function invalidateStale(maxAgeMs: number): number {
   try {
     const db = getDbInstance();
     const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-    const result = db.prepare("DELETE FROM semantic_cache WHERE created_at < ?").run(cutoff);
-    return result.changes || 0;
-  } catch {
-    return 0;
-  }
-}
-
-// ── Auto-cleanup timer ──
-
-let _cleanupTimer: ReturnType<typeof setInterval> | null = null;
-
-/**
- * Start periodic auto-cleanup of expired entries.
- * @param {number} intervalMs - Cleanup interval (default: 5 minutes)
- */
-export function startAutoCleanup(intervalMs = 300_000): void {
-  stopAutoCleanup();
-  _cleanupTimer = setInterval(() => {
-    const removed = cleanExpiredEntries();
-    if (removed > 0) {
-      console.log(`[SemanticCache] Auto-cleaned ${removed} expired entries`);
-    }
-  }, intervalMs);
-  if (_cleanupTimer && typeof _cleanupTimer === "object" && "unref" in _cleanupTimer) {
-    (_cleanupTimer as { unref?: () => void }).unref?.();
-  }
-}
-
-/**
- * Stop periodic auto-cleanup.
- */
-export function stopAutoCleanup(): void {
-  if (_cleanupTimer) {
-    clearInterval(_cleanupTimer);
-    _cleanupTimer = null;
-  }
-}
-
-export function cleanOldMetrics(retentionDays = 90): number {
-  try {
-    const db = getDbInstance();
-    const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString();
     const result = db.prepare("DELETE FROM semantic_cache WHERE created_at < ?").run(cutoff);
     return result.changes || 0;
   } catch {
@@ -379,14 +349,29 @@ export function getCacheStats() {
 }
 
 /**
- * Check if a request is cacheable.
- * Only non-streaming, deterministic (temperature=0) requests.
+ * Check if a cached response can be served for this request.
+ * Works for both streaming and non-streaming requests (cache hit returns JSON).
+ * Requires explicit numeric `temperature: 0` — omitted temperature is NOT cached
+ * because the provider default may be non-deterministic (e.g. random/creative tasks).
  */
-export function isCacheable(body, headers) {
+export function isCacheableForRead(body, headers) {
   if ((getHeaderValue(headers, "x-omniroute-no-cache") || "").toLowerCase() === "true") {
     return false;
   }
-  if (body.stream !== false) return false;
-  if ((body.temperature ?? 0) !== 0) return false;
+  if (typeof body.temperature !== "number" || body.temperature !== 0) return false;
+  return true;
+}
+
+/**
+ * Check if a response should be stored in cache after completion.
+ * Works for both streaming and non-streaming responses.
+ * Requires explicit `temperature: 0` — omitted temperature is NOT cacheable
+ * because the provider default may be non-deterministic.
+ */
+export function isCacheableForWrite(body, headers) {
+  if ((getHeaderValue(headers, "x-omniroute-no-cache") || "").toLowerCase() === "true") {
+    return false;
+  }
+  if (body.temperature !== 0) return false;
   return true;
 }

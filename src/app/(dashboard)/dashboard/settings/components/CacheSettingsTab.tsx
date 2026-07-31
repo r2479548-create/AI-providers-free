@@ -1,190 +1,155 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { Card, Button } from "@/shared/components";
+import { useCallback, useEffect, useState } from "react";
+import { Button, Card } from "@/shared/components";
 import { useTranslations } from "next-intl";
 
-interface CacheConfig {
-  semanticCacheEnabled: boolean;
-  semanticCacheMaxSize: number;
-  semanticCacheTTL: number;
-  promptCacheEnabled: boolean;
-  promptCacheStrategy: "auto" | "system-only" | "manual";
-  alwaysPreserveClientCache: "auto" | "always" | "never";
+type Message = { type: "success" | "error"; text: string };
+
+interface CacheConfigResponse {
+  modelCatalogCacheTtlMs: number;
+  [key: string]: unknown;
 }
+
+const DEFAULT_TTL_MS = 1500;
+const MIN_TTL_MS = 100;
+const MAX_TTL_MS = 60000;
 
 export default function CacheSettingsTab() {
   const t = useTranslations("settings");
-  const [config, setConfig] = useState<CacheConfig>({
-    semanticCacheEnabled: true,
-    semanticCacheMaxSize: 100,
-    semanticCacheTTL: 1800000,
-    promptCacheEnabled: true,
-    promptCacheStrategy: "auto",
-    alwaysPreserveClientCache: "auto",
-  });
-  const [saving, setSaving] = useState(false);
+  const [value, setValue] = useState(String(DEFAULT_TTL_MS));
+  const [savedValue, setSavedValue] = useState(String(DEFAULT_TTL_MS));
   const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<Message | null>(null);
 
   useEffect(() => {
-    fetch("/api/settings/cache-config")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (data) setConfig(data);
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, []);
+    let active = true;
 
-  const handleSave = async () => {
+    fetch("/api/settings/cache-config")
+      .then((response) => {
+        if (!response.ok) throw new Error(`Cache config API returned ${response.status}`);
+        return response.json() as Promise<CacheConfigResponse>;
+      })
+      .then((config) => {
+        if (!active) return;
+        const ms = config.modelCatalogCacheTtlMs ?? DEFAULT_TTL_MS;
+        const str = typeof ms === "number" && Number.isFinite(ms) ? String(ms) : String(DEFAULT_TTL_MS);
+        setValue(str);
+        setSavedValue(str);
+      })
+      .catch((error) => {
+        console.error("Failed to load cache config:", error);
+        if (active) setMessage({ type: "error", text: t("cacheConfigLoadFailed") });
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [t]);
+
+  const dirty = value.trim() !== savedValue;
+
+  const saveTtl = useCallback(async () => {
+    if (!dirty) return;
+
+    const parsed = Number(value.trim());
+    if (!Number.isInteger(parsed)) return;
+    if (parsed < MIN_TTL_MS || parsed > MAX_TTL_MS) return;
+
     setSaving(true);
+    setMessage(null);
+
     try {
-      await fetch("/api/settings/cache-config", {
+      const response = await fetch("/api/settings/cache-config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(config),
+        body: JSON.stringify({ modelCatalogCacheTtlMs: parsed }),
       });
+
+      if (!response.ok) throw new Error(`Cache config API returned ${response.status}`);
+
+      const config = (await response.json()) as CacheConfigResponse;
+      const saved = String(config.modelCatalogCacheTtlMs ?? parsed);
+      setValue(saved);
+      setSavedValue(saved);
+      setMessage({ type: "success", text: t("cacheConfigSaveSuccess") });
+    } catch (error) {
+      console.error("Failed to save cache config:", error);
+      setMessage({ type: "error", text: t("cacheConfigSaveFailed") });
     } finally {
       setSaving(false);
     }
-  };
+  }, [dirty, t, value]);
 
-  if (loading) {
-    return (
-      <Card className="p-6">
-        <p className="text-sm text-text-muted">{t("loading")}</p>
-      </Card>
-    );
-  }
+  const validationError = (() => {
+    const trimmed = value.trim();
+    if (!trimmed) return "Required";
+    const parsed = Number(trimmed);
+    if (!Number.isInteger(parsed)) return t("modelCatalogTtlWholeNumberError");
+    if (parsed < MIN_TTL_MS) return t("modelCatalogTtlMinimumError", { min: MIN_TTL_MS });
+    if (parsed > MAX_TTL_MS) return t("modelCatalogTtlMaximumError", { max: MAX_TTL_MS });
+    return null;
+  })();
 
   return (
-    <Card className="p-6">
-      <h3 className="text-lg font-semibold text-text-main flex items-center gap-2 mb-4">
-        <span className="material-symbols-outlined text-[20px]">cached</span>
-        {t("cacheSettings")}
-      </h3>
-
-      <div className="space-y-6">
-        {/* Semantic Cache */}
-        <div className="space-y-3">
-          <h4 className="text-sm font-medium text-text-main">{t("semanticCache")}</h4>
-
-          <label className="flex items-center justify-between">
-            <span className="text-sm text-text-muted">{t("enabled")}</span>
-            <button
-              onClick={() =>
-                setConfig((c) => ({ ...c, semanticCacheEnabled: !c.semanticCacheEnabled }))
-              }
-              className={`relative w-10 h-5 rounded-full transition-colors ${
-                config.semanticCacheEnabled ? "bg-green-500" : "bg-border"
-              }`}
-            >
-              <span
-                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                  config.semanticCacheEnabled ? "left-5" : "left-0.5"
-                }`}
-              />
-            </button>
-          </label>
-
-          <label className="flex items-center justify-between">
-            <span className="text-sm text-text-muted">{t("maxEntries")}</span>
-            <input
-              type="number"
-              min={1}
-              max={1000}
-              value={config.semanticCacheMaxSize}
-              onChange={(e) =>
-                setConfig((c) => ({ ...c, semanticCacheMaxSize: parseInt(e.target.value) || 100 }))
-              }
-              className="w-24 px-2 py-1 text-sm rounded border border-border bg-surface text-text-main"
-            />
-          </label>
-
-          <label className="flex items-center justify-between">
-            <span className="text-sm text-text-muted">{t("ttlMinutes")}</span>
-            <input
-              type="number"
-              min={1}
-              max={1440}
-              value={Math.round(config.semanticCacheTTL / 60000)}
-              onChange={(e) =>
-                setConfig((c) => ({
-                  ...c,
-                  semanticCacheTTL: (parseInt(e.target.value) || 30) * 60000,
-                }))
-              }
-              className="w-24 px-2 py-1 text-sm rounded border border-border bg-surface text-text-main"
-            />
-          </label>
+    <Card className="p-6 mt-4">
+      <div className="flex flex-col gap-3">
+        <div>
+          <p className="font-medium">{t("modelCatalogCacheTtl")}</p>
+          <p className="text-sm text-text-muted mt-1">{t("modelCatalogCacheTtlDescription")}</p>
         </div>
-
-        {/* Prompt Cache */}
-        <div className="space-y-3 pt-4 border-t border-border/30">
-          <h4 className="text-sm font-medium text-text-main">{t("promptCache")}</h4>
-
-          <label className="flex items-center justify-between">
-            <span className="text-sm text-text-muted">{t("enabled")}</span>
-            <button
-              onClick={() =>
-                setConfig((c) => ({ ...c, promptCacheEnabled: !c.promptCacheEnabled }))
-              }
-              className={`relative w-10 h-5 rounded-full transition-colors ${
-                config.promptCacheEnabled ? "bg-green-500" : "bg-border"
-              }`}
-            >
-              <span
-                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                  config.promptCacheEnabled ? "left-5" : "left-0.5"
-                }`}
-              />
-            </button>
+        <div className="flex items-center gap-3">
+          <label htmlFor="model-catalog-ttl-ms" className="sr-only">
+            {t("modelCatalogCacheTtlLabel")}
           </label>
-
-          <label className="flex items-center justify-between">
-            <span className="text-sm text-text-muted">{t("strategy")}</span>
-            <select
-              value={config.promptCacheStrategy}
-              onChange={(e) =>
-                setConfig((c) => ({
-                  ...c,
-                  promptCacheStrategy: e.target.value as CacheConfig["promptCacheStrategy"],
-                }))
-              }
-              className="px-2 py-1 text-sm rounded border border-border bg-surface text-text-main"
-            >
-              <option value="auto">Auto</option>
-              <option value="system-only">System Only</option>
-              <option value="manual">Manual</option>
-            </select>
-          </label>
-
-          <label className="flex items-center justify-between">
-            <span className="text-sm text-text-muted">{t("preserveClientCache")}</span>
-            <select
-              value={config.alwaysPreserveClientCache}
-              onChange={(e) =>
-                setConfig((c) => ({
-                  ...c,
-                  alwaysPreserveClientCache: e.target
-                    .value as CacheConfig["alwaysPreserveClientCache"],
-                }))
-              }
-              className="px-2 py-1 text-sm rounded border border-border bg-surface text-text-main"
-            >
-              <option value="auto">Auto</option>
-              <option value="always">Always</option>
-              <option value="never">Never</option>
-            </select>
-          </label>
-        </div>
-
-        {/* Save */}
-        <div className="pt-4 border-t border-border/30">
-          <Button onClick={handleSave} disabled={saving} size="sm">
-            {saving ? t("saving") : t("save")}
+          <input
+            id="model-catalog-ttl-ms"
+            type="number"
+            min={MIN_TTL_MS}
+            max={MAX_TTL_MS}
+            step={100}
+            value={value}
+            onChange={(event) => {
+              setValue(event.target.value);
+              setMessage(null);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && dirty) void saveTtl();
+            }}
+            className="w-32 px-3 py-1.5 rounded bg-surface-2 border border-border text-sm text-text-primary"
+            disabled={loading || saving}
+          />
+          <span className="text-xs text-text-muted">ms</span>
+          <Button
+            size="sm"
+            variant="primary"
+            disabled={loading || Boolean(validationError) || !dirty}
+            onClick={saveTtl}
+          >
+            {saving ? t("modelCatalogCacheTtlSaving") : t("modelCatalogCacheTtlSave")}
           </Button>
+          {dirty && (
+            <span className="text-xs text-text-muted">
+              {t("modelCatalogCacheTtlCurrent", { value: savedValue })}
+            </span>
+          )}
         </div>
+        {validationError && <p className="text-xs text-red-500">{validationError}</p>}
+        {message && (
+          <p
+            className={`text-xs ${
+              message.type === "success"
+                ? "text-green-600 dark:text-green-400"
+                : "text-red-600 dark:text-red-400"
+            }`}
+          >
+            {message.text}
+          </p>
+        )}
       </div>
     </Card>
   );

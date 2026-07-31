@@ -1,5 +1,7 @@
 "use client";
 
+import { useTranslations } from "next-intl";
+
 /**
  * EmptyState — FASE-07 UX
  *
@@ -26,11 +28,14 @@ interface EmptyStateProps {
 
 export default function EmptyState({
   icon = "📭",
-  title = "Nothing here yet",
+  title,
   description = "",
   actionLabel = "",
   onAction = null,
 }: EmptyStateProps) {
+  const t = useTranslations("common");
+  const resolvedTitle = title ?? t("nothingHere");
+  const usesMaterialSymbol = /^[a-z][a-z0-9_]*$/.test(icon);
   return (
     <div
       style={{
@@ -53,7 +58,13 @@ export default function EmptyState({
         role="img"
         aria-hidden="true"
       >
-        {icon}
+        {usesMaterialSymbol ? (
+          <span className="material-symbols-outlined" style={{ fontSize: "inherit" }}>
+            {icon}
+          </span>
+        ) : (
+          icon
+        )}
       </div>
       <h3
         style={{
@@ -64,7 +75,7 @@ export default function EmptyState({
           margin: 0,
         }}
       >
-        {title}
+        {resolvedTitle}
       </h3>
       {description && (
         <p

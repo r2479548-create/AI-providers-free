@@ -1,71 +1,75 @@
-import os from "node:os";
+import type { AntigravityClientProfile } from "@/shared/constants/antigravityClientProfile";
+import {
+  getCachedAntigravityCliVersion,
+  getCachedAntigravityIdeVersion,
+} from "./antigravityVersion.ts";
 
-/**
- * Antigravity and Gemini CLI header utilities.
- *
- * Generates User-Agent strings and API client headers that match
- * the real Antigravity and Gemini CLI binaries.
- *
- * Based on CLIProxyAPI's misc/header_utils.go.
- */
+export const ANTIGRAVITY_IDE_NODE_API_CLIENT = "google-api-nodejs-client/10.3.0";
+export const ANTIGRAVITY_IDE_NODE_X_GOOG_API_CLIENT = "gl-node/22.21.1";
 
-const ANTIGRAVITY_VERSION = "1.21.9";
-const GEMINI_CLI_VERSION = "0.31.0";
-const GEMINI_SDK_VERSION = "1.41.0";
-const NODE_VERSION = "v22.19.0";
+// Antigravity presents the native macOS desktop client fingerprint: the upstream
+// backend expects the Mac build, so the OS/arch token is pinned to darwin/arm64
+// regardless of the host OmniRoute happens to run on (#8098). The IDE / CLI /
+// IDE-Node User-Agent split (#8013) is preserved — only the platform token is fixed.
+const ANTIGRAVITY_OS_TYPE = "darwin";
+const ANTIGRAVITY_ARCH = "arm64";
 
-function getPlatform(): string {
-  const p = os.platform();
-  switch (p) {
-    case "win32":
-      return "win32";
-    case "darwin":
-      return "darwin";
-    default:
-      return p; // "linux", etc.
+function withOptionalBearerAuth(
+  headers: Record<string, string>,
+  accessToken?: string | null
+): Record<string, string> {
+  if (accessToken) {
+    headers.Authorization = `Bearer ${accessToken}`;
   }
+  return headers;
 }
 
-function getArch(): string {
-  const a = os.arch();
-  switch (a) {
-    case "x64":
-      return "x64";
-    case "ia32":
-      return "x86";
-    case "arm64":
-      return "arm64";
-    default:
-      return a;
-  }
+export function antigravityIdeUserAgent(version = getCachedAntigravityIdeVersion()): string {
+  return `antigravity/ide/${version} ${ANTIGRAVITY_OS_TYPE}/${ANTIGRAVITY_ARCH}`;
 }
 
-/**
- * Antigravity User-Agent: "antigravity/VERSION darwin/arm64"
- *
- * Always claims darwin/arm64 regardless of actual server OS.
- * Real Antigravity is a macOS desktop tool — most users are on macOS.
- * Claiming linux/amd64 from a datacenter IP is MORE suspicious than
- * darwin/arm64. Matches CLIProxyAPI's proven production behavior.
- */
-export function antigravityUserAgent(): string {
-  return `antigravity/${ANTIGRAVITY_VERSION} darwin/arm64`;
+export function antigravityCliUserAgent(
+  version = getCachedAntigravityCliVersion(),
+  authMethod = "consumer"
+): string {
+  return `antigravity/cli/${version} (aidev_client; os_type=${ANTIGRAVITY_OS_TYPE}; arch=${ANTIGRAVITY_ARCH}; auth_method=${authMethod})`;
 }
 
-/**
- * Gemini CLI User-Agent: "GeminiCLI/VERSION/MODEL (OS; ARCH)"
- * Example: "GeminiCLI/0.31.0/gemini-3-flash (darwin; arm64)"
- */
-export function geminiCLIUserAgent(model: string): string {
-  return `GeminiCLI/${GEMINI_CLI_VERSION}/${model || "unknown"} (${getPlatform()}; ${getArch()})`;
+export function antigravityIdeNodeUserAgent(version = getCachedAntigravityIdeVersion()): string {
+  return `antigravity/${version} ${ANTIGRAVITY_OS_TYPE}/${ANTIGRAVITY_ARCH} ${ANTIGRAVITY_IDE_NODE_API_CLIENT}`;
 }
 
-/**
- * X-Goog-Api-Client header value matching the real Gemini SDK.
- * Example: "google-genai-sdk/1.41.0 gl-node/v22.19.0"
- */
-export function googApiClientHeader(): string {
-  return `google-genai-sdk/${GEMINI_SDK_VERSION} gl-node/${NODE_VERSION}`;
+export function getAntigravityOAuthUserAgent(profile: AntigravityClientProfile): string {
+  return profile === "cli" ? antigravityCliUserAgent() : antigravityIdeNodeUserAgent();
 }
 
-export { ANTIGRAVITY_VERSION, GEMINI_CLI_VERSION, GEMINI_SDK_VERSION };
+export function getAntigravityContentHeaders(
+  profile: AntigravityClientProfile,
+  accessToken?: string | null
+): Record<string, string> {
+  return withOptionalBearerAuth(
+    {
+      "Content-Type": "application/json",
+      "User-Agent": profile === "cli" ? antigravityCliUserAgent() : antigravityIdeUserAgent(),
+    },
+    accessToken
+  );
+}
+
+export function getAntigravityIdeNodeHeaders(accessToken?: string | null): Record<string, string> {
+  return withOptionalBearerAuth(
+    {
+      "Content-Type": "application/json",
+      "User-Agent": antigravityIdeNodeUserAgent(),
+      "X-Goog-Api-Client": ANTIGRAVITY_IDE_NODE_X_GOOG_API_CLIENT,
+    },
+    accessToken
+  );
+}
+
+/** Native loadCodeAssist body metadata captured from both official clients. */
+export function getAntigravityLoadCodeAssistMetadata(): Record<string, string> {
+  return {
+    ideType: "ANTIGRAVITY",
+  };
+}

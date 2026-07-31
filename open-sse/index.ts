@@ -50,6 +50,9 @@ export {
   isAccountUnavailable,
   getUnavailableUntil,
   filterAvailableAccounts,
+  isProviderInCooldown,
+  getProviderCooldownRemainingMs,
+  getProvidersInCooldown,
 } from "./services/accountFallback.ts";
 
 export {
@@ -57,9 +60,8 @@ export {
   refreshAccessToken,
   refreshClaudeOAuthToken,
   refreshGoogleToken,
-  refreshQwenToken,
   refreshCodexToken,
-  refreshIflowToken,
+  refreshQoderToken,
   refreshGitHubToken,
   refreshCopilotToken,
   getAccessToken,

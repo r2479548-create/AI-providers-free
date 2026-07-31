@@ -11,7 +11,8 @@
  * Uses Promise.allSettled so one slow/down node doesn't block others.
  */
 
-import { getProviderNodes } from "@/lib/localDb";
+import { getCachedProviderNodes } from "@/lib/localDb";
+import { isAutomatedTestProcess } from "@/shared/utils/testProcess";
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -32,6 +33,11 @@ const CHECK_TIMEOUT_MS = 5_000;
 const INITIAL_DELAY_MS = 15_000; // Wait for server boot before first sweep
 const LOG_PREFIX = "[LocalHealthCheck]";
 const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
+
+function isBuildProcess(): boolean {
+  return typeof process !== "undefined" && process.env.NEXT_PHASE === "phase-production-build";
+}
+
 
 // ── State (globalThis survives HMR re-evaluation) ───────────────────────
 
@@ -69,7 +75,11 @@ function isEnvFlagEnabled(name: string): boolean {
 }
 
 function isLocalHealthCheckDisabled(): boolean {
-  return isEnvFlagEnabled("OMNIROUTE_DISABLE_LOCAL_HEALTHCHECK") || process.env.NODE_ENV === "test";
+  return (
+    isEnvFlagEnabled("OMNIROUTE_DISABLE_LOCAL_HEALTHCHECK") ||
+    isBuildProcess() ||
+    isAutomatedTestProcess()
+  );
 }
 
 function isLocalhostUrl(baseUrl: string): boolean {
@@ -142,7 +152,7 @@ export async function sweep(): Promise<void> {
   try {
     let nodes: Array<{ id: string; prefix: string; baseUrl: string }>;
     try {
-      const raw = await getProviderNodes();
+      const raw = await getCachedProviderNodes();
       nodes = (Array.isArray(raw) ? raw : []).filter(
         (n: Record<string, unknown>) =>
           typeof n.baseUrl === "string" && isLocalhostUrl(n.baseUrl as string)

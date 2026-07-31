@@ -1,10 +1,8 @@
-import { CORS_ORIGIN } from "@/shared/utils/cors";
 import { handleAudioSpeech } from "@omniroute/open-sse/handlers/audioSpeech.ts";
+import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
 import {
-  getProviderCredentials,
+  getProviderCredentialsWithQuotaPreflight,
   clearRecoveredProviderState,
-  extractApiKey,
-  isValidApiKey,
 } from "@/sse/services/auth";
 import {
   parseSpeechModel,
@@ -15,9 +13,17 @@ import {
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
-import { getProviderNodes } from "@/lib/localDb";
+import { getCachedProviderNodes } from "@/lib/localDb";
 import { v1AudioSpeechSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import {
+  isAllRateLimitedCredentials,
+  rateLimitedProviderResponse,
+} from "@/app/api/v1/_shared/rateLimit";
+import { attachOmniRouteMetaToResponse } from "@/domain/omnirouteResponseMeta";
+import { calculateModalCost } from "@/lib/usage/costCalculator";
+import { generateRequestId } from "@/shared/utils/requestId";
+import { getClientIpFromRequest } from "@/lib/ipUtils";
 
 /**
  * Handle CORS preflight
@@ -25,7 +31,6 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 export async function OPTIONS() {
   return new Response(null, {
     headers: {
-      "Access-Control-Allow-Origin": CORS_ORIGIN,
       "Access-Control-Allow-Methods": "POST, OPTIONS",
       "Access-Control-Allow-Headers": "*",
     },
@@ -36,14 +41,7 @@ export async function OPTIONS() {
  * POST /v1/audio/speech — text-to-speech
  * OpenAI TTS API compatible. Returns audio stream.
  */
-export async function POST(request) {
-  if (process.env.REQUIRE_API_KEY === "true") {
-    const apiKey = extractApiKey(request);
-    if (!apiKey) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
-  }
-
+async function postHandler(request, context) {
   let rawBody;
   try {
     rawBody = await request.json();
@@ -56,6 +54,7 @@ export async function POST(request) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, validation.error.message);
   }
   const body = validation.data;
+  const startTime = Date.now();
 
   // Enforce API key policies (model restrictions + budget limits)
   const policy = await enforceApiKeyPolicy(request, body.model);
@@ -64,7 +63,7 @@ export async function POST(request) {
   // Load local provider_nodes for audio routing (only localhost — prevents auth bypass/SSRF)
   let dynamicProviders: ReturnType<typeof buildDynamicAudioProvider>[] = [];
   try {
-    const nodes = await getProviderNodes();
+    const nodes = await getCachedProviderNodes();
     dynamicProviders = (Array.isArray(nodes) ? (nodes as unknown as ProviderNodeRow[]) : [])
       .filter((n: ProviderNodeRow) => {
         if (n.apiType !== "chat" && n.apiType !== "responses") return false;
@@ -100,20 +99,39 @@ export async function POST(request) {
   // Get credentials — skip for local providers (authType: "none")
   let credentials = null;
   if (providerConfig && providerConfig.authType !== "none") {
-    credentials = await getProviderCredentials(provider);
+    credentials = await getProviderCredentialsWithQuotaPreflight(provider);
     if (!credentials) {
       return errorResponse(HTTP_STATUS.BAD_REQUEST, `No credentials for provider: ${provider}`);
     }
+    if (isAllRateLimitedCredentials(credentials)) {
+      return rateLimitedProviderResponse(provider, credentials);
+    }
   }
 
-  const response = await handleAudioSpeech({
+  let response = await handleAudioSpeech({
     body,
     credentials,
     resolvedProvider: providerConfig,
     resolvedModel,
+    clientIp: getClientIpFromRequest(request),
   });
   if (response?.ok) {
     await clearRecoveredProviderState(credentials);
+    // TTS is billed per input character; attach cost telemetry without
+    // touching the audio Content-Type / body (ADD-only headers).
+    const characters = typeof body.input === "string" ? body.input.length : 0;
+    const costUsd = await calculateModalCost("audio", provider, resolvedModel || body.model, {
+      characters,
+    });
+    response = attachOmniRouteMetaToResponse(response, {
+      provider,
+      model: resolvedModel || body.model,
+      costUsd,
+      latencyMs: Date.now() - startTime,
+      requestId: generateRequestId(),
+    });
   }
   return response;
 }
+
+export const POST = withInjectionGuard(postHandler);

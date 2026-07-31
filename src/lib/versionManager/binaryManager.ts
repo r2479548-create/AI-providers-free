@@ -51,8 +51,39 @@ async function extractTarGz(archivePath: string, destDir: string): Promise<void>
   await execFileAsync("tar", ["xzf", archivePath, "-C", destDir]);
 }
 
+/**
+ * #5590: Windows has no `unzip` on the system PATH — it only ships inside Git for
+ * Windows' `usr/bin`, which Node's `spawn` PATH never sees, so `execFile("unzip")`
+ * fails with `spawn unzip ENOENT`. Use PowerShell's built-in `Expand-Archive`
+ * there (present on every supported Windows; this is the install path for the
+ * Node-24-only embedded services). `execFileAsync` uses no shell, so the paths are
+ * a single argument and are not shell-interpreted; the `''` escaping covers the
+ * PowerShell `-Command` string and `-LiteralPath` prevents wildcard expansion.
+ */
+export function buildExtractZipCommand(
+  platform: NodeJS.Platform,
+  archivePath: string,
+  destDir: string
+): { command: string; args: string[] } {
+  if (platform === "win32") {
+    const src = archivePath.replace(/'/g, "''");
+    const dst = destDir.replace(/'/g, "''");
+    return {
+      command: "powershell",
+      args: [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `Expand-Archive -LiteralPath '${src}' -DestinationPath '${dst}' -Force`,
+      ],
+    };
+  }
+  return { command: "unzip", args: ["-o", archivePath, "-d", destDir] };
+}
+
 async function extractZip(archivePath: string, destDir: string): Promise<void> {
-  await execFileAsync("unzip", ["-o", archivePath, "-d", destDir]);
+  const { command, args } = buildExtractZipCommand(process.platform, archivePath, destDir);
+  await execFileAsync(command, args);
 }
 
 async function verifyChecksum(filePath: string, expectedSha256: string): Promise<boolean> {
@@ -69,7 +100,9 @@ async function verifyChecksum(filePath: string, expectedSha256: string): Promise
 function findBinaryInDir(dir: string): string | null {
   const candidates = ["cli-proxy-api", "cli-proxy-api.exe", "CLIProxyAPI", "CLIProxyAPI.exe"];
   for (const name of candidates) {
-    if (fsSync.existsSync(path.join(dir, name))) return path.join(dir, name);
+    if (fsSync.existsSync(path.join(/* turbopackIgnore: true */ dir, name))) {
+      return path.join(/* turbopackIgnore: true */ dir, name);
+    }
   }
   return null;
 }
@@ -146,7 +179,7 @@ export async function getCurrentBinaryPath(dataDir?: string): Promise<string | n
   const symlinkPath = path.join(dir, "bin", "cliproxyapi");
   try {
     const real = await fs.realpath(symlinkPath);
-    return fsSync.existsSync(real) ? real : null;
+    return fsSync.existsSync(/* turbopackIgnore: true */ real) ? real : null;
   } catch {
     return null;
   }
@@ -159,7 +192,10 @@ export async function getInstalledVersions(dataDir?: string): Promise<string[]> 
     const entries = await fs.readdir(binDir);
     return entries
       .filter(
-        (e) => e.startsWith("cliproxyapi-") && fsSync.statSync(path.join(binDir, e)).isDirectory()
+        (e) =>
+          typeof e === "string" &&
+          e.startsWith("cliproxyapi-") &&
+          fsSync.statSync(path.join(/* turbopackIgnore: true */ binDir, e)).isDirectory()
       )
       .map((e) => e.replace("cliproxyapi-", ""));
   } catch {
