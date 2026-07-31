@@ -1,5 +1,6 @@
-import { CORS_ORIGIN } from "@/shared/utils/cors";
 import { handleVideoGeneration } from "@omniroute/open-sse/handlers/videoGeneration.ts";
+import { resolveVideoCredentialProvider } from "@omniroute/open-sse/handlers/videoGeneration/googleFlow.ts";
+import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
 import {
   getProviderCredentials,
   clearRecoveredProviderState,
@@ -18,6 +19,13 @@ import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { v1ImageGenerationSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import {
+  isAllRateLimitedCredentials,
+  rateLimitedProviderResponse,
+} from "@/app/api/v1/_shared/rateLimit";
+import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
+import { calculateModalCost } from "@/lib/usage/costCalculator";
+import { generateRequestId } from "@/shared/utils/requestId";
 
 /**
  * Handle CORS preflight
@@ -25,7 +33,6 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 export async function OPTIONS() {
   return new Response(null, {
     headers: {
-      "Access-Control-Allow-Origin": CORS_ORIGIN,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "*",
     },
@@ -57,7 +64,7 @@ export async function GET() {
 /**
  * POST /v1/videos/generations — generate videos
  */
-export async function POST(request) {
+async function postHandler(request, context) {
   let rawBody;
   try {
     rawBody = await request.json();
@@ -71,17 +78,10 @@ export async function POST(request) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, validation.error.message);
   }
   const body = validation.data;
+  const startTime = Date.now();
 
-  // Optional API key validation
-  if (process.env.REQUIRE_API_KEY === "true") {
-    const apiKey = extractApiKey(request);
-    if (!apiKey) {
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
-    }
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) {
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
-    }
+  if (typeof body.prompt !== "string" || body.prompt.trim().length === 0) {
+    return errorResponse(HTTP_STATUS.BAD_REQUEST, "Prompt is required");
   }
 
   // Enforce API key policies (model restrictions + budget limits)
@@ -100,15 +100,20 @@ export async function POST(request) {
   // Check provider config for auth bypass
   const providerConfig = getVideoProvider(provider);
 
-  // Get credentials — skip for local providers (authType: "none")
+  // Get credentials — skip for local providers (authType: "none").
+  // Google Flow has no standalone connection: it reuses the Antigravity Google
+  // OAuth credential (resolveVideoCredentialProvider maps googleflow → antigravity).
   let credentials = null;
   if (providerConfig && providerConfig.authType !== "none") {
-    credentials = await getProviderCredentials(provider);
+    credentials = await getProviderCredentials(resolveVideoCredentialProvider(provider));
     if (!credentials) {
       return errorResponse(
         HTTP_STATUS.BAD_REQUEST,
         `No credentials for video provider: ${provider}`
       );
+    }
+    if (isAllRateLimitedCredentials(credentials)) {
+      return rateLimitedProviderResponse(provider, credentials);
     }
   }
 
@@ -116,9 +121,19 @@ export async function POST(request) {
 
   if (result.success) {
     await clearRecoveredProviderState(credentials);
-    return new Response(JSON.stringify((result as any).data), {
+    const seconds = Number(body.duration) || 0;
+    const costUsd = await calculateModalCost("video", provider, body.model, { seconds });
+    const headers = new Headers({ "Content-Type": "application/json" });
+    attachOmniRouteMetaHeaders(headers, {
+      provider,
+      model: body.model,
+      costUsd,
+      latencyMs: Date.now() - startTime,
+      requestId: generateRequestId(),
+    });
+    return new Response(JSON.stringify((result as { data: unknown }).data), {
       status: 200,
-      headers: { "Content-Type": "application/json" },
+      headers,
     });
   }
 
@@ -128,3 +143,5 @@ export async function POST(request) {
     headers: { "Content-Type": "application/json" },
   });
 }
+
+export const POST = withInjectionGuard(postHandler);

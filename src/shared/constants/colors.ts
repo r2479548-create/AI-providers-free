@@ -22,7 +22,6 @@ export const PROVIDER_COLORS = {
   qoder: { bg: "#EC4899", text: "#fff", label: "Qoder" },
   fireworks: { bg: "#F97316", text: "#fff", label: "Fireworks" },
   kimi: { bg: "#06B6D4", text: "#fff", label: "Kimi" },
-  "gemini-cli": { bg: "#34A853", text: "#fff", label: "Gemini CLI" },
 };
 
 // ═══════════════════════════════════════════
@@ -37,6 +36,15 @@ export const PROTOCOL_COLORS = {
   warmup: { bg: "#F59E0B", text: "#000", label: "Warmup" },
   bypass: { bg: "#6B7280", text: "#fff", label: "Bypass" },
 };
+
+const PROTOCOL_KEY_ALIASES = {
+  "openai-chat": "openai",
+  "openai-response": "openai-responses",
+};
+
+function normalizeProtocolKey(protocol) {
+  return PROTOCOL_KEY_ALIASES[protocol] || protocol;
+}
 
 // ═══════════════════════════════════════════
 // Proxy Type Colors (ProxyLogger)
@@ -121,16 +129,19 @@ export function getProxyStatusStyle(status) {
 }
 
 /**
- * Get default fallback for a provider color lookup.
- * @param {string} provider - Provider key
+ * Get default fallback for a protocol color lookup.
+ * @param {string} protocol - Protocol key
+ * @param {string} fallbackProvider - Provider key to use as a secondary protocol key
  * @returns {{ bg: string, text: string, label: string }}
  */
-export function getProviderColor(provider) {
+export function getProtocolColor(protocol, fallbackProvider) {
+  const normalized = normalizeProtocolKey(protocol);
   return (
-    PROVIDER_COLORS[provider] || {
-      bg: "#374151",
+    PROTOCOL_COLORS[normalized] ||
+    PROTOCOL_COLORS[fallbackProvider] || {
+      bg: "#6B7280",
       text: "#fff",
-      label: (provider || "-").toUpperCase(),
+      label: (protocol || fallbackProvider || "-").toUpperCase(),
     }
   );
 }

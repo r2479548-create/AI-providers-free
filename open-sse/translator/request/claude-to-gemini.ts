@@ -6,21 +6,37 @@ import {
   cleanJSONSchemaForAntigravity,
 } from "../helpers/geminiHelper.ts";
 import { DEFAULT_THINKING_GEMINI_SIGNATURE } from "../../config/defaultThinkingSignature.ts";
-import { buildGeminiTools } from "../helpers/geminiToolsSanitizer.ts";
+import { buildGeminiTools, sanitizeGeminiToolName } from "../helpers/geminiToolsSanitizer.ts";
+import { capMaxOutputTokens, capThinkingBudget } from "../../../src/lib/modelCapabilities.ts";
 
 /**
  * Direct Claude → Gemini request translator.
  * Converts Claude Messages API body directly to Gemini format,
  * skipping the OpenAI hub intermediate step.
  */
-export function claudeToGeminiRequest(model, body, stream) {
+export function claudeToGeminiRequest(model, body, stream, credentials = null) {
+  const toolNameMap = new Map<string, string>();
+  const sanitizeToolName = (name: string) =>
+    sanitizeGeminiToolName(name, {
+      toolNameMap,
+    });
+  // Vertex AI rejects the `id` field inside function_call / function_response parts
+  // (#3440). The public Gemini API keeps it for Gemini 3+ signature matching, so this
+  // is scoped to the routed vertex provider only (threaded via credentials._provider).
+  const provider = credentials && typeof credentials === "object" ? credentials._provider : null;
+  const stripFunctionCallId = provider === "vertex" || provider === "vertex-partner";
   const result: {
     model: string;
     contents: Array<Record<string, unknown>>;
     generationConfig: Record<string, unknown>;
     safetySettings: unknown;
     systemInstruction?: { role: string; parts: Array<{ text: string }> };
-    tools?: Array<{ functionDeclarations: Array<Record<string, unknown>> }>;
+    tools?: Array<{
+      functionDeclarations?: Array<Record<string, unknown>>;
+      googleSearch?: Record<string, unknown>;
+      googleSearchRetrieval?: Record<string, unknown>;
+    }>;
+    _toolNameMap?: Map<string, string>;
   } = {
     model: model,
     contents: [],
@@ -39,7 +55,10 @@ export function claudeToGeminiRequest(model, body, stream) {
     result.generationConfig.topK = body.top_k;
   }
   if (body.max_tokens !== undefined) {
-    result.generationConfig.maxOutputTokens = body.max_tokens;
+    const maxOutputTokens = capMaxOutputTokens(model, body.max_tokens);
+    if (maxOutputTokens !== null) {
+      result.generationConfig.maxOutputTokens = maxOutputTokens;
+    }
   }
 
   // ── System instruction ─────────────────────────────────────────
@@ -52,7 +71,7 @@ export function claudeToGeminiRequest(model, body, stream) {
     }
     if (systemText) {
       result.systemInstruction = {
-        role: "user",
+        role: "system",
         parts: [{ text: systemText }],
       };
     }
@@ -65,7 +84,7 @@ export function claudeToGeminiRequest(model, body, stream) {
       if (msg.role === "assistant" && Array.isArray(msg.content)) {
         for (const block of msg.content) {
           if (block.type === "tool_use" && block.id && block.name) {
-            toolUseNames[block.id] = block.name;
+            toolUseNames[block.id] = sanitizeToolName(block.name);
           }
         }
       }
@@ -88,15 +107,14 @@ export function claudeToGeminiRequest(model, body, stream) {
               // Preserve thinking blocks as thought parts
               if (block.thinking) {
                 parts.push({ thought: true, text: block.thinking });
-                parts.push({ thoughtSignature: DEFAULT_THINKING_GEMINI_SIGNATURE, text: "" });
               }
               break;
 
             case "tool_use":
               parts.push({
                 functionCall: {
-                  id: block.id,
-                  name: block.name,
+                  ...(stripFunctionCallId ? {} : { id: block.id }),
+                  name: sanitizeToolName(block.name),
                   args: block.input || {},
                 },
               });
@@ -117,7 +135,7 @@ export function claudeToGeminiRequest(model, body, stream) {
               }
               parts.push({
                 functionResponse: {
-                  id: block.tool_use_id,
+                  ...(stripFunctionCallId ? {} : { id: block.tool_use_id }),
                   name: toolUseNames[block.tool_use_id] || "unknown",
                   response: { result: parsedContent },
                 },
@@ -146,21 +164,11 @@ export function claudeToGeminiRequest(model, body, stream) {
         // Map Claude roles to Gemini roles
         const geminiRole = msg.role === "assistant" ? "model" : "user";
 
-        // Gemini 3+ expects the signature on the first functionCall part in a tool-call
-        // batch. If the assistant turn had no explicit thinking block, inject a fallback
-        // signature into that first functionCall. (#927)
+        // Gemini 3+ expects the signature on all functionCall parts in a tool-call
+        // batch. If there is no real signature, we don't inject a fake one because
+        // Gemini API strictly validates it and returns 400.
         if (geminiRole === "model") {
-          const hasFunctionCall = parts.some((p) => p.functionCall);
-          const hasSignature = parts.some((p) => p.thoughtSignature);
-          if (hasFunctionCall && !hasSignature) {
-            const fcIndex = parts.findIndex((p) => p.functionCall);
-            if (fcIndex >= 0) {
-              parts[fcIndex] = {
-                ...parts[fcIndex],
-                thoughtSignature: DEFAULT_THINKING_GEMINI_SIGNATURE,
-              };
-            }
-          }
+          // No operation needed since we no longer inject fake signatures.
         }
 
         result.contents.push({ role: geminiRole, parts });
@@ -169,23 +177,60 @@ export function claudeToGeminiRequest(model, body, stream) {
   }
 
   // ── Convert tools ──────────────────────────────────────────────
-  const geminiTools = buildGeminiTools(body.tools);
+  const geminiTools = buildGeminiTools(body.tools, {
+    toolNameMap,
+  });
   if (geminiTools) {
     result.tools = geminiTools;
   }
 
   // ── Thinking config ────────────────────────────────────────────
-  if (body.thinking?.type === "enabled" && body.thinking.budget_tokens) {
+  // Priority: thinking.budget_tokens (Claude native) > output_config.effort (Claude Code).
+  if (model.startsWith("gemma-4")) {
+    // gemma-4 models returns - 400: Thinking budget is not supported for this model
+  } else if (body.thinking?.type === "enabled" && body.thinking.budget_tokens) {
     result.generationConfig.thinkingConfig = {
       thinkingBudget: body.thinking.budget_tokens,
       includeThoughts: true,
     };
+  } else if (typeof body.output_config?.effort === "string") {
+    const effort = body.output_config.effort.toLowerCase();
+    const effortBudgetMap: Record<string, number> = {
+      none: 0,
+      low: 1024,
+      medium: 10240,
+      high: 32768,
+      max: 131072,
+      xhigh: 131072,
+    };
+    const rawBudget = effortBudgetMap[effort];
+    // #3842: clamp to the model's real thinking-budget cap. This path previously
+    // sent the raw value with no cap, so a Claude-Code client hitting a Flash-tier
+    // Gemini target via output_config.effort="high" sent 32768 (> 24576) → 400.
+    // capThinkingBudget narrows 32768 to e.g. gemini-2.5-flash's 24576 while leaving
+    // pro-tier (real cap 32768) untouched.
+    const budget = rawBudget !== undefined ? capThinkingBudget(model, rawBudget) : undefined;
+    if (budget !== undefined && budget > 0) {
+      result.generationConfig.thinkingConfig = {
+        thinkingBudget: budget,
+        includeThoughts: true,
+      };
+    }
+  }
+
+  const changedToolNameMap = new Map(
+    [...toolNameMap.entries()].filter(
+      ([sanitizedName, originalName]) => sanitizedName !== originalName
+    )
+  );
+  if (changedToolNameMap.size > 0) {
+    result._toolNameMap = changedToolNameMap;
   }
 
   return result;
 }
 
 // Register direct path only for plain Gemini API.
-// Gemini CLI / Antigravity require Cloud Code envelope wrapping,
+// Antigravity requires Cloud Code envelope wrapping,
 // so they must use the existing hub path (Claude -> OpenAI -> target).
 register(FORMATS.CLAUDE, FORMATS.GEMINI, claudeToGeminiRequest, null);

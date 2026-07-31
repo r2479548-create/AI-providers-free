@@ -1,16 +1,29 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import PropTypes from "prop-types";
 import Modal from "./Modal";
 import Button from "./Button";
 import Input from "./Input";
+
+type KiroAuthModalProps = {
+  isOpen: boolean;
+  providerId?: string;
+  providerLabel?: string;
+  onMethodSelect: (method: string, config?: Record<string, unknown>) => void;
+  onClose: () => void;
+};
 
 /**
  * Kiro Auth Method Selection Modal
  * Auto-detects token from AWS SSO cache or allows manual import
  */
-export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
+export default function KiroAuthModal({
+  isOpen,
+  providerId = "kiro",
+  providerLabel = "Kiro",
+  onMethodSelect,
+  onClose,
+}: KiroAuthModalProps) {
   const [selectedMethod, setSelectedMethod] = useState(null);
   const [idcStartUrl, setIdcStartUrl] = useState("");
   const [idcRegion, setIdcRegion] = useState("us-east-1");
@@ -19,6 +32,10 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
   const [importing, setImporting] = useState(false);
   const [autoDetecting, setAutoDetecting] = useState(false);
   const [autoDetected, setAutoDetected] = useState(false);
+  // IDC/organization credentials returned by auto-import when the SSO cache token
+  // has a clientIdHash. Spread into the import POST body so the regional OIDC
+  // endpoint is used for token refresh instead of the social path (#2059).
+  const [idcCredentials, setIdcCredentials] = useState<Record<string, string> | null>(null);
 
   // Auto-detect token when import method is selected
   useEffect(() => {
@@ -28,14 +45,27 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
       setAutoDetecting(true);
       setError(null);
       setAutoDetected(false);
+      setIdcCredentials(null);
 
       try {
-        const res = await fetch("/api/oauth/kiro/auto-import");
+        const res = await fetch(
+          `/api/oauth/kiro/auto-import?targetProvider=${encodeURIComponent(providerId)}`
+        );
         const data = await res.json();
 
         if (data.found) {
           setRefreshToken(data.refreshToken);
           setAutoDetected(true);
+          // Store IDC/organization credentials if present in the auto-detect response
+          if (data.clientId && data.clientSecret) {
+            setIdcCredentials({
+              clientId: data.clientId,
+              clientSecret: data.clientSecret,
+              ...(data.region ? { region: data.region } : {}),
+              ...(data.authMethod ? { authMethod: data.authMethod } : {}),
+              ...(data.profileArn ? { profileArn: data.profileArn } : {}),
+            });
+          }
         } else {
           setError(data.error || "Could not auto-detect token");
         }
@@ -47,7 +77,7 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
     };
 
     autoDetect();
-  }, [selectedMethod, isOpen]);
+  }, [providerId, selectedMethod, isOpen]);
 
   const handleMethodSelect = (method) => {
     setSelectedMethod(method);
@@ -69,11 +99,17 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
     setError(null);
 
     try {
-      const res = await fetch("/api/oauth/kiro/import", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refreshToken: refreshToken.trim() }),
-      });
+      const res = await fetch(
+        `/api/oauth/kiro/import?targetProvider=${encodeURIComponent(providerId)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            refreshToken: refreshToken.trim(),
+            ...(idcCredentials || {}),
+          }),
+        }
+      );
 
       const data = await res.json();
 
@@ -103,7 +139,7 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
   };
 
   return (
-    <Modal isOpen={isOpen} title="Connect Kiro" onClose={onClose} size="lg">
+    <Modal isOpen={isOpen} title={`Connect ${providerLabel}`} onClose={onClose} size="lg">
       <div className="flex flex-col gap-4">
         {/* Method Selection */}
         {!selectedMethod && (
@@ -120,32 +156,35 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
                 <div className="flex-1">
                   <h3 className="font-semibold mb-1">AWS Builder ID</h3>
                   <p className="text-sm text-text-muted">
-                    Recommended for most users. Free AWS account required.
+                    Recommended for most users. Sign in with the AWS account linked to{" "}
+                    {providerLabel}.
                   </p>
                 </div>
               </div>
             </button>
 
-            {/* AWS IAM Identity Center (IDC) - HIDDEN */}
+            {/* AWS IAM Identity Center (IDC) */}
             <button
               onClick={() => handleMethodSelect("idc")}
-              className="hidden w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
+              className="w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
             >
               <div className="flex items-start gap-3">
                 <span className="material-symbols-outlined text-primary mt-0.5">business</span>
                 <div className="flex-1">
-                  <h3 className="font-semibold mb-1">AWS IAM Identity Center</h3>
+                  <h3 className="font-semibold mb-1">
+                    Your Organization (AWS IAM Identity Center)
+                  </h3>
                   <p className="text-sm text-text-muted">
-                    For enterprise users with custom AWS IAM Identity Center.
+                    Use your company SSO start URL (example: https://your-org.awsapps.com/start).
                   </p>
                 </div>
               </div>
             </button>
 
-            {/* Google Social Login - HIDDEN */}
+            {/* Google Social Login */}
             <button
-              onClick={() => handleMethodSelect("social-google")}
-              className="hidden w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
+              onClick={() => handleSocialLogin("google")}
+              className="w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
             >
               <div className="flex items-start gap-3">
                 <span className="material-symbols-outlined text-primary mt-0.5">
@@ -153,25 +192,21 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
                 </span>
                 <div className="flex-1">
                   <h3 className="font-semibold mb-1">Google Account</h3>
-                  <p className="text-sm text-text-muted">
-                    Login with your Google account (manual callback).
-                  </p>
+                  <p className="text-sm text-text-muted">Login with your Google account.</p>
                 </div>
               </div>
             </button>
 
-            {/* GitHub Social Login - HIDDEN */}
+            {/* GitHub Social Login */}
             <button
-              onClick={() => handleMethodSelect("social-github")}
-              className="hidden w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
+              onClick={() => handleSocialLogin("github")}
+              className="w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
             >
               <div className="flex items-start gap-3">
                 <span className="material-symbols-outlined text-primary mt-0.5">code</span>
                 <div className="flex-1">
                   <h3 className="font-semibold mb-1">GitHub Account</h3>
-                  <p className="text-sm text-text-muted">
-                    Login with your GitHub account (manual callback).
-                  </p>
+                  <p className="text-sm text-text-muted">Login with your GitHub account.</p>
                 </div>
               </div>
             </button>
@@ -185,7 +220,9 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
                 <span className="material-symbols-outlined text-primary mt-0.5">file_upload</span>
                 <div className="flex-1">
                   <h3 className="font-semibold mb-1">Import Token</h3>
-                  <p className="text-sm text-text-muted">Paste refresh token from Kiro IDE.</p>
+                  <p className="text-sm text-text-muted">
+                    Paste a refresh token exported from {providerLabel}.
+                  </p>
                 </div>
               </div>
             </button>
@@ -310,7 +347,9 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
                   </span>
                 </div>
                 <h3 className="text-lg font-semibold mb-2">Auto-detecting token...</h3>
-                <p className="text-sm text-text-muted">Reading from AWS SSO cache</p>
+                <p className="text-sm text-text-muted">
+                  Reading {providerLabel} credentials from AWS SSO cache
+                </p>
               </div>
             )}
 
@@ -325,7 +364,7 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
                         check_circle
                       </span>
                       <p className="text-sm text-green-800 dark:text-green-200">
-                        Token auto-detected from Kiro IDE successfully!
+                        Token auto-detected from {providerLabel} successfully!
                       </p>
                     </div>
                   </div>
@@ -339,7 +378,8 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
                         info
                       </span>
                       <p className="text-sm text-blue-800 dark:text-blue-200">
-                        Kiro IDE not detected. Please paste your refresh token manually.
+                        {providerLabel} token was not auto-detected. Please paste your refresh token
+                        manually.
                       </p>
                     </div>
                   </div>
@@ -383,9 +423,3 @@ export default function KiroAuthModal({ isOpen, onMethodSelect, onClose }) {
     </Modal>
   );
 }
-
-KiroAuthModal.propTypes = {
-  isOpen: PropTypes.bool.isRequired,
-  onMethodSelect: PropTypes.func.isRequired,
-  onClose: PropTypes.func.isRequired,
-};

@@ -4,9 +4,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Card, Button } from "@/shared/components";
 import { useTranslations } from "next-intl";
 
+type McpTransport = "stdio" | "sse" | "streamable-http";
+
 type McpStatusResponse = {
   status: "online" | "offline";
   online: boolean;
+  enabled: boolean;
+  transport: McpTransport;
+  scopesEnforced?: boolean;
   heartbeatPath: string;
   heartbeat: {
     pid: number;
@@ -21,6 +26,12 @@ type McpStatusResponse = {
     heartbeatAgeMs: number | null;
     uptimeMs: number | null;
   } | null;
+  httpTransport: {
+    online: boolean;
+    transport: "sse" | "streamable-http" | null;
+    startedAt: number | null;
+    uptime: string | null;
+  };
   activity: {
     totalCalls24h: number;
     successRate: number;
@@ -69,72 +80,90 @@ const AUDIT_PAGE_SIZE = 20;
 
 const RESILIENCE_PRESETS = {
   aggressive: {
-    profiles: {
+    requestQueue: {
+      requestsPerMinute: 180,
+      minTimeBetweenRequestsMs: 100,
+      concurrentRequests: 16,
+    },
+    connectionCooldown: {
       oauth: {
-        transientCooldown: 3000,
-        rateLimitCooldown: 30000,
-        maxBackoffLevel: 4,
-        circuitBreakerThreshold: 2,
-        circuitBreakerReset: 30000,
+        baseCooldownMs: 30000,
+        useUpstreamRetryHints: false,
+        maxBackoffSteps: 4,
       },
       apikey: {
-        transientCooldown: 2000,
-        rateLimitCooldown: 0,
-        maxBackoffLevel: 3,
-        circuitBreakerThreshold: 3,
-        circuitBreakerReset: 15000,
+        baseCooldownMs: 2000,
+        useUpstreamRetryHints: true,
+        maxBackoffSteps: 3,
       },
     },
-    defaults: {
-      requestsPerMinute: 180,
-      minTimeBetweenRequests: 100,
-      concurrentRequests: 16,
+    providerBreaker: {
+      oauth: {
+        failureThreshold: 2,
+        resetTimeoutMs: 30000,
+      },
+      apikey: {
+        failureThreshold: 3,
+        resetTimeoutMs: 15000,
+      },
     },
   },
   balanced: {
-    profiles: {
+    requestQueue: {
+      requestsPerMinute: 100,
+      minTimeBetweenRequestsMs: 200,
+      concurrentRequests: 10,
+    },
+    connectionCooldown: {
       oauth: {
-        transientCooldown: 5000,
-        rateLimitCooldown: 60000,
-        maxBackoffLevel: 8,
-        circuitBreakerThreshold: 3,
-        circuitBreakerReset: 60000,
+        baseCooldownMs: 60000,
+        useUpstreamRetryHints: false,
+        maxBackoffSteps: 8,
       },
       apikey: {
-        transientCooldown: 3000,
-        rateLimitCooldown: 0,
-        maxBackoffLevel: 5,
-        circuitBreakerThreshold: 5,
-        circuitBreakerReset: 30000,
+        baseCooldownMs: 3000,
+        useUpstreamRetryHints: true,
+        maxBackoffSteps: 5,
       },
     },
-    defaults: {
-      requestsPerMinute: 100,
-      minTimeBetweenRequests: 200,
-      concurrentRequests: 10,
+    providerBreaker: {
+      oauth: {
+        failureThreshold: 3,
+        resetTimeoutMs: 60000,
+      },
+      apikey: {
+        failureThreshold: 5,
+        resetTimeoutMs: 30000,
+      },
     },
   },
   conservative: {
-    profiles: {
+    requestQueue: {
+      requestsPerMinute: 60,
+      minTimeBetweenRequestsMs: 350,
+      concurrentRequests: 6,
+    },
+    connectionCooldown: {
       oauth: {
-        transientCooldown: 8000,
-        rateLimitCooldown: 120000,
-        maxBackoffLevel: 10,
-        circuitBreakerThreshold: 8,
-        circuitBreakerReset: 120000,
+        baseCooldownMs: 120000,
+        useUpstreamRetryHints: false,
+        maxBackoffSteps: 10,
       },
       apikey: {
-        transientCooldown: 5000,
-        rateLimitCooldown: 30000,
-        maxBackoffLevel: 8,
-        circuitBreakerThreshold: 8,
-        circuitBreakerReset: 60000,
+        baseCooldownMs: 30000,
+        useUpstreamRetryHints: false,
+        maxBackoffSteps: 8,
       },
     },
-    defaults: {
-      requestsPerMinute: 60,
-      minTimeBetweenRequests: 350,
-      concurrentRequests: 6,
+    providerBreaker: {
+      oauth: {
+        failureThreshold: 8,
+        resetTimeoutMs: 120000,
+      },
+      apikey: {
+        failureThreshold: 8,
+        resetTimeoutMs: 60000,
+      },
     },
   },
 } as const;
@@ -335,28 +364,25 @@ export default function McpDashboardPage() {
   const totalPages = Math.max(1, Math.ceil((auditData.total || 0) / AUDIT_PAGE_SIZE));
   const currentPage = Math.floor((auditData.offset || 0) / AUDIT_PAGE_SIZE) + 1;
   const topTools = status?.activity?.topTools || [];
+  const runtimeTransport = status?.transport || status?.heartbeat?.transport || "—";
+  const runtimeUptime =
+    status?.transport === "stdio"
+      ? formatDuration(status?.heartbeat?.uptimeMs ?? null)
+      : status?.httpTransport?.uptime || "—";
+  const heartbeatLabel =
+    status?.transport === "stdio" ? formatDuration(status?.heartbeat?.heartbeatAgeMs ?? null) : "—";
 
   if (loading) {
-    return (
-      <div className="p-6 max-w-7xl mx-auto">
-        <div className="text-sm text-text-muted">{t("loading")}</div>
-      </div>
-    );
+    return <div className="text-sm text-text-muted">{t("loading")}</div>;
   }
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-6">
+    <div className="space-y-6">
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
         <StatCard label={t("processStatus")} value={status?.online ? t("online") : t("offline")} />
         <StatCard label={t("pid")} value={status?.heartbeat?.pid ?? "—"} />
-        <StatCard
-          label={t("sessionUptime")}
-          value={formatDuration(status?.heartbeat?.uptimeMs ?? null)}
-        />
-        <StatCard
-          label={t("lastHeartbeat")}
-          value={formatDuration(status?.heartbeat?.heartbeatAgeMs ?? null)}
-        />
+        <StatCard label={t("sessionUptime")} value={runtimeUptime} />
+        <StatCard label={t("lastHeartbeat")} value={heartbeatLabel} />
       </div>
 
       <Card className="p-5">
@@ -394,13 +420,12 @@ export default function McpDashboardPage() {
             <h3 className="text-sm font-semibold mb-2">{t("runtimeDetails")}</h3>
             <div className="text-sm space-y-1">
               <p>
-                {t("transport")}:{" "}
-                <span className="font-mono">{status?.heartbeat?.transport || "—"}</span>
+                {t("transport")}: <span className="font-mono">{runtimeTransport}</span>
               </p>
               <p>
                 {t("scopesEnforced")}:{" "}
                 <span className="font-semibold">
-                  {status?.heartbeat?.scopesEnforced ? t("yes") : t("no")}
+                  {(status?.scopesEnforced ?? status?.heartbeat?.scopesEnforced) ? t("yes") : t("no")}
                 </span>
               </p>
               <p>

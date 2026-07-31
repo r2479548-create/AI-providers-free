@@ -1,21 +1,35 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
-import PropTypes from "prop-types";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useTranslations } from "next-intl";
 import Modal from "./Modal";
 import Button from "./Button";
 import Input from "./Input";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
+import { parseResponseBody, getErrorMessage } from "@/shared/utils/api";
+import { isCredentialBlob, submitCredentialBlob } from "@/shared/components/oauthBlobSubmit";
 
-const GOOGLE_OAUTH_PROVIDERS = new Set(["antigravity", "gemini-cli"]);
+const GOOGLE_OAUTH_PROVIDERS = new Set(["antigravity", "agy"]);
+
+/** Providers that use a local callback server on a random port (PKCE browser flow). */
+const PKCE_CALLBACK_SERVER_PROVIDERS = new Set(["codex"]);
+
+/**
+ * Phase 1 hotfix (2026-05-29): windsurf & devin-cli only support import-token.
+ * Their PKCE flow targeting app.devin.ai/editor/signin returned 404 post-rebrand.
+ * Phase 2 will reintroduce browser login via Firebase OAuth + RegisterUser.
+ * Spec: _tasks/superpowers/specs/2026-05-29-windsurf-login-fix-design.md.
+ */
+const IMPORT_TOKEN_ONLY_PROVIDERS = new Set(["windsurf", "devin-cli", "grok-cli"]);
 
 type OAuthModalProps = {
   isOpen: boolean;
   provider?: string;
-  providerInfo?: { name: string } | null;
+  providerInfo?: { name?: string } | null;
   onSuccess?: () => void;
   onClose: () => void;
   idcConfig?: unknown;
+  reauthConnection?: null | { id?: string };
 };
 
 /**
@@ -30,7 +44,9 @@ export default function OAuthModal({
   onSuccess,
   onClose,
   idcConfig,
+  reauthConnection,
 }: OAuthModalProps) {
+  const t = useTranslations("oauthModal");
   const [step, setStep] = useState("waiting"); // waiting | input | success | error
   const [authData, setAuthData] = useState(null);
   const [callbackUrl, setCallbackUrl] = useState("");
@@ -38,35 +54,52 @@ export default function OAuthModal({
   const [isDeviceCode, setIsDeviceCode] = useState(false);
   const [deviceData, setDeviceData] = useState(null);
   const [polling, setPolling] = useState(false);
+  // API-key paste mode: for providers that accept a token directly (windsurf, devin-cli)
+  const [showPasteToken, setShowPasteToken] = useState(
+    provider === "windsurf" || provider === "devin-cli" || provider === "grok-cli"
+  );
+  const [pasteToken, setPasteToken] = useState("");
+  const [savingToken, setSavingToken] = useState(false);
+
+  const supportsTokenPaste =
+    provider === "windsurf" || provider === "devin-cli" || provider === "grok-cli";
+  // Phase 1 hotfix (2026-05-29): windsurf/devin-cli are import-token-only.
+  // Hide the "Browser Login" tab — Phase 2 will restore it via Firebase OAuth.
+  const importTokenOnly = IMPORT_TOKEN_ONLY_PROVIDERS.has(provider);
   const popupRef = useRef(null);
   const { copied, copy } = useCopyToClipboard();
+  const deviceVerificationUrl =
+    deviceData?.verification_uri_complete || deviceData?.verification_uri || "";
 
-  // State for client-only values to avoid hydration mismatch
-  const [isLocalhost, setIsLocalhost] = useState(false);
-  const [placeholderUrl, setPlaceholderUrl] = useState("/callback?code=...");
+  // Client-only runtime values
+  const runtimeLocation = useMemo(() => {
+    if (typeof window === "undefined") {
+      return {
+        isLocalhost: false,
+        isTrueLocalhost: false,
+        placeholderUrl: "/callback?code=...",
+      };
+    }
+
+    const hostname = window.location.hostname;
+    const isLocal =
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname.startsWith("192.168.") ||
+      hostname.startsWith("10.") ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(hostname);
+    const isTrulyLocal = hostname === "localhost" || hostname === "127.0.0.1";
+
+    return {
+      isLocalhost: isLocal,
+      isTrueLocalhost: isTrulyLocal,
+      placeholderUrl: `${window.location.origin}/callback?code=...`,
+    };
+  }, []);
+
+  const { isLocalhost, isTrueLocalhost, placeholderUrl } = runtimeLocation;
   const callbackProcessedRef = useRef(false);
   const flowStartedRef = useRef(false);
-
-  // Detect if running on true localhost vs LAN IP (client-side only)
-  // - True localhost (127.0.0.1/localhost): popup auto-callback works
-  // - LAN IPs (192.168.x, 10.x, 172.x): redirect URI uses localhost but callback
-  //   won't resolve back to the VPS, so use manual paste mode
-  const [isTrueLocalhost, setIsTrueLocalhost] = useState(false);
-  useEffect(() => {
-    if (typeof window !== "undefined") {
-      const hostname = window.location.hostname;
-      const isLocal =
-        hostname === "localhost" ||
-        hostname === "127.0.0.1" ||
-        hostname.startsWith("192.168.") ||
-        hostname.startsWith("10.") ||
-        /^172\.(1[6-9]|2\d|3[01])\./.test(hostname);
-      const isTrulyLocal = hostname === "localhost" || hostname === "127.0.0.1";
-      setIsLocalhost(isLocal);
-      setIsTrueLocalhost(isTrulyLocal);
-      setPlaceholderUrl(`${window.location.origin}/callback?code=...`);
-    }
-  }, []);
 
   // Define all useCallback hooks BEFORE the useEffects that reference them
 
@@ -89,12 +122,13 @@ export default function OAuthModal({
           body: JSON.stringify({
             code,
             redirectUri: authData.redirectUri,
+            connectionId: reauthConnection?.id,
             codeVerifier: authData.codeVerifier,
             ...(normalizedState ? { state: normalizedState } : {}),
           }),
         });
 
-        const data = await res.json();
+        const data = (await parseResponseBody(res)) as Record<string, unknown>;
         if (!res.ok) {
           const errorObject =
             typeof data.error === "object" && data.error !== null
@@ -126,9 +160,7 @@ export default function OAuthModal({
           setError(
             "redirect_uri_mismatch: The default Google OAuth credentials only work on localhost. " +
               "For remote use, configure your own OAuth credentials via environment variables: " +
-              (provider === "antigravity"
-                ? "ANTIGRAVITY_OAUTH_CLIENT_ID and ANTIGRAVITY_OAUTH_CLIENT_SECRET"
-                : "GEMINI_CLI_OAUTH_CLIENT_ID and GEMINI_CLI_OAUTH_CLIENT_SECRET") +
+              "ANTIGRAVITY_OAUTH_CLIENT_ID and ANTIGRAVITY_OAUTH_CLIENT_SECRET" +
               ". See the README section 'OAuth on a Remote Server'."
           );
         } else {
@@ -137,8 +169,40 @@ export default function OAuthModal({
         setStep("error");
       }
     },
-    [authData, provider, onSuccess]
+    [authData, provider, onSuccess, reauthConnection]
   );
+
+  // Save a raw API token directly (windsurf / devin-cli import-token path)
+  const handleSaveToken = useCallback(async () => {
+    const token = pasteToken.trim();
+    if (!token || !provider) return;
+    setSavingToken(true);
+    setError(null);
+    try {
+      // POST to /exchange with a synthetic "import_token" payload.
+      // The windsurf provider's mapTokens() handles a bare accessToken/apiKey field.
+      const res = await fetch(`/api/oauth/${provider}/import-token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          token,
+          connectionId: reauthConnection?.id,
+        }),
+      });
+      const data = (await parseResponseBody(res)) as Record<string, unknown>;
+      if (!res.ok) {
+        const errMsg = getErrorMessage(data, res.status, "Save failed");
+        throw new Error(errMsg);
+      }
+      setStep("success");
+      onSuccess?.();
+    } catch (err) {
+      // Show error inline inside the paste-token form (don't flip to error step)
+      setError(err.message);
+    } finally {
+      setSavingToken(false);
+    }
+  }, [pasteToken, provider, onSuccess, reauthConnection]);
 
   // Poll for device code token
   const startPolling = useCallback(
@@ -153,10 +217,15 @@ export default function OAuthModal({
           const res = await fetch(`/api/oauth/${provider}/poll`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ deviceCode, codeVerifier, extraData }),
+            body: JSON.stringify({
+              deviceCode,
+              connectionId: reauthConnection?.id,
+              codeVerifier,
+              extraData,
+            }),
           });
 
-          const data = await res.json();
+          const data = (await parseResponseBody(res)) as Record<string, unknown>;
 
           if (data.success) {
             setStep("success");
@@ -184,7 +253,7 @@ export default function OAuthModal({
       setStep("error");
       setPolling(false);
     },
-    [provider, onSuccess]
+    [provider, onSuccess, reauthConnection]
   );
 
   // Start OAuth flow
@@ -198,20 +267,33 @@ export default function OAuthModal({
         provider === "github" ||
         provider === "qwen" ||
         provider === "kiro" ||
+        provider === "amazon-q" ||
         provider === "kimi-coding" ||
-        provider === "kilocode"
+        provider === "kilocode" ||
+        provider === "codebuddy-cn"
       ) {
         setIsDeviceCode(true);
         setStep("waiting");
 
-        const res = await fetch(`/api/oauth/${provider}/device-code`);
-        const data = await res.json();
+        const deviceCodeUrl = new URL(`/api/oauth/${provider}/device-code`, window.location.origin);
+        if (
+          (provider === "kiro" || provider === "amazon-q") &&
+          idcConfig &&
+          typeof idcConfig === "object"
+        ) {
+          const idc = idcConfig as { startUrl?: string; region?: string };
+          if (typeof idc.startUrl === "string" && idc.startUrl.trim()) {
+            deviceCodeUrl.searchParams.set("startUrl", idc.startUrl.trim());
+          }
+          if (typeof idc.region === "string" && idc.region.trim()) {
+            deviceCodeUrl.searchParams.set("region", idc.region.trim());
+          }
+        }
+
+        const res = await fetch(deviceCodeUrl.toString());
+        const data = (await parseResponseBody(res)) as Record<string, unknown>;
         if (!res.ok) {
-          const errMsg =
-            typeof data.error === "object" && data.error !== null
-              ? ((data.error as Record<string, unknown>).message as string) ||
-                JSON.stringify(data.error)
-              : data.error || "Request failed";
+          const errMsg = getErrorMessage(data, res.status, "Request failed");
           throw new Error(errMsg);
         }
 
@@ -223,8 +305,12 @@ export default function OAuthModal({
 
         // Start polling - pass extraData for Kiro (contains _clientId, _clientSecret)
         const extraData =
-          provider === "kiro"
-            ? { _clientId: data._clientId, _clientSecret: data._clientSecret }
+          provider === "kiro" || provider === "amazon-q"
+            ? {
+                _clientId: data._clientId,
+                _clientSecret: data._clientSecret,
+                _region: data._region,
+              }
             : null;
         startPolling(data.device_code, data.codeVerifier, data.interval || 5, extraData);
         return;
@@ -239,15 +325,19 @@ export default function OAuthModal({
         forceManual = true;
       }
 
-      // Codex: on localhost use callback server on port 1455,
-      // on remote use standard auth code flow (callback server is unreachable)
-      if (provider === "codex") {
-        if (isLocalhost) {
-          // Localhost: use callback server on port 1455 + polling
+      // PKCE callback server providers (Codex, Windsurf, Devin CLI):
+      // On localhost, spin up a local callback server and poll for the result.
+      // Codex uses a fixed port 1455; Windsurf/Devin CLI use a random OS-assigned port.
+      // On remote the server is unreachable — fall through to standard manual flow.
+      if (PKCE_CALLBACK_SERVER_PROVIDERS.has(provider)) {
+        if (isTrueLocalhost) {
           try {
-            const serverRes = await fetch(`/api/oauth/codex/start-callback-server`);
-            const serverData = await serverRes.json();
-            if (!serverRes.ok) throw new Error(serverData.error);
+            const serverRes = await fetch(`/api/oauth/${provider}/start-callback-server`);
+            const serverData = (await parseResponseBody(serverRes)) as Record<string, unknown>;
+            if (!serverRes.ok)
+              throw new Error(
+                getErrorMessage(serverData, serverRes.status, "Failed to start callback server")
+              );
 
             setAuthData({ ...serverData, redirectUri: serverData.redirectUri });
             setStep("waiting");
@@ -263,12 +353,12 @@ export default function OAuthModal({
             for (let i = 0; i < maxAttempts; i++) {
               await new Promise((r) => setTimeout(r, 2000));
 
-              const pollRes = await fetch(`/api/oauth/codex/poll-callback`, {
+              const pollRes = await fetch(`/api/oauth/${provider}/poll-callback`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({}),
+                body: JSON.stringify({ connectionId: reauthConnection?.id }),
               });
-              const pollData = await pollRes.json();
+              const pollData = (await parseResponseBody(pollRes)) as Record<string, unknown>;
 
               if (pollData.success) {
                 setStep("success");
@@ -284,10 +374,10 @@ export default function OAuthModal({
 
             setPolling(false);
             throw new Error("Authorization timeout");
-          } catch (codexErr) {
+          } catch (pkceErr) {
             console.warn(
-              "Codex callback server failed, falling back to standard manual flow",
-              codexErr
+              `${provider} callback server failed, falling back to manual flow`,
+              pkceErr
             );
             setPolling(false);
             forceManual = true;
@@ -299,19 +389,29 @@ export default function OAuthModal({
       // Authorization code flow
       // Redirect URI strategy:
       // - Codex/OpenAI: always port 1455 (registered in OAuth app)
-      // - Google OAuth providers (antigravity, gemini-cli): always localhost, regardless of
-      //   where OmniRoute is hosted — Google only accepts pre-registered localhost URIs with
-      //   the built-in credentials. Remote users must configure their own credentials.
+      // - Windsurf/Devin CLI (remote fallback): use localhost with OmniRoute port + /auth/callback
+      //   (on true localhost the callback server handles it; this is only reached on remote)
+      // - Google OAuth providers (antigravity/agy): default to loopback so the
+      //   bundled native/desktop credentials keep working. Prefer 127.0.0.1 over
+      //   localhost for the Google native-app handoff; Google documents that localhost
+      //   can run into local firewall/name-resolution edge cases. The authorize route
+      //   upgrades this to the public callback when custom Google web credentials plus
+      //   NEXT_PUBLIC_BASE_URL or OMNIROUTE_PUBLIC_BASE_URL are configured.
       // - Other providers on remote: use actual origin (supports PUBLIC_URL env var)
       // - Localhost: use localhost:port
       let redirectUri: string;
       if (provider === "codex" || provider === "openai") {
         redirectUri = "http://localhost:1455/auth/callback";
-      } else if (GOOGLE_OAUTH_PROVIDERS.has(provider)) {
-        // Google OAuth built-in credentials only accept localhost redirect URIs.
-        // Even in remote deployments we use localhost — user copies the callback URL manually.
+      } else if (provider === "windsurf" || provider === "devin-cli") {
+        // Remote fallback: use OmniRoute's port with the /auth/callback path Windsurf expects.
+        // On true localhost this code is never reached (callback server handles the flow above).
         const port = window.location.port || "20128";
-        redirectUri = `http://localhost:${port}/callback`;
+        redirectUri = `http://localhost:${port}/auth/callback`;
+      } else if (GOOGLE_OAUTH_PROVIDERS.has(provider)) {
+        // Google OAuth built-in credentials only accept loopback redirect URIs.
+        // Even in remote deployments we use loopback — user copies the callback URL manually.
+        const port = window.location.port || "20128";
+        redirectUri = `http://127.0.0.1:${port}/callback`;
       } else if (!isLocalhost) {
         // Behind reverse proxy: use actual origin (e.g., https://omniroute.example.com/callback)
         // Supports PUBLIC_URL env var override, or falls back to window.location.origin.
@@ -329,13 +429,9 @@ export default function OAuthModal({
       const res = await fetch(
         `/api/oauth/${provider}/authorize?redirect_uri=${encodeURIComponent(redirectUri)}`
       );
-      const data = await res.json();
+      const data = (await parseResponseBody(res)) as Record<string, unknown>;
       if (!res.ok) {
-        const errMsg =
-          typeof data.error === "object" && data.error !== null
-            ? ((data.error as Record<string, unknown>).message as string) ||
-              JSON.stringify(data.error)
-            : data.error || "Authorization failed";
+        const errMsg = getErrorMessage(data, res.status, "Authorization failed");
         throw new Error(errMsg);
       }
 
@@ -346,7 +442,7 @@ export default function OAuthModal({
         );
       }
 
-      setAuthData({ ...data, redirectUri });
+      setAuthData({ ...data, redirectUri: data.redirectUri || redirectUri });
 
       // For non-true-localhost (LAN IPs, remote) or manual fallback: use manual input mode (user pastes callback URL)
       if (!isTrueLocalhost || forceManual) {
@@ -366,7 +462,15 @@ export default function OAuthModal({
       setError(err.message);
       setStep("error");
     }
-  }, [provider, isLocalhost, isTrueLocalhost, startPolling, onSuccess]);
+  }, [
+    provider,
+    isLocalhost,
+    isTrueLocalhost,
+    startPolling,
+    onSuccess,
+    reauthConnection,
+    idcConfig,
+  ]);
 
   // Reset guard when modal closes
   useEffect(() => {
@@ -402,6 +506,13 @@ export default function OAuthModal({
 
       const { code, state, error: callbackError, errorDescription } = data;
 
+      if (authData?.state && state && state !== authData.state) {
+        callbackProcessedRef.current = true;
+        setError("OAuth state mismatch. Restart the connection and try again.");
+        setStep("error");
+        return;
+      }
+
       if (callbackError) {
         callbackProcessedRef.current = true;
         setError(errorDescription || callbackError);
@@ -420,12 +531,30 @@ export default function OAuthModal({
       // Accept same-origin OR localhost with same port (remote access scenario:
       // dashboard at 192.168.x:port, callback redirects to localhost:port)
       const currentPort = window.location.port;
-      const isLocalhostSamePort =
-        event.origin.match(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/) &&
-        new URL(event.origin).port === currentPort;
-      if (event.origin !== window.location.origin && !isLocalhostSamePort) return;
+      let isLoopbackOrigin = false;
+      let isLocalhostSamePort = false;
+      try {
+        const eventUrl = new URL(event.origin);
+        isLoopbackOrigin = /^(localhost|127\.0\.0\.1|\[::1\]|::1)$/i.test(eventUrl.hostname);
+        isLocalhostSamePort = isLoopbackOrigin && eventUrl.port === currentPort;
+      } catch {
+        // Ignore malformed origins.
+      }
+
+      const payload = event.data?.data;
+      const hasMatchingState = !!authData?.state && payload?.state === authData.state;
+      const isGoogleLoopbackRelay =
+        GOOGLE_OAUTH_PROVIDERS.has(provider) && isLoopbackOrigin && hasMatchingState;
+
+      if (
+        event.origin !== window.location.origin &&
+        !isLocalhostSamePort &&
+        !isGoogleLoopbackRelay
+      ) {
+        return;
+      }
       if (event.data?.type === "oauth_callback") {
-        handleCallback(event.data.data);
+        handleCallback(payload);
       }
     };
     window.addEventListener("message", handleMessage);
@@ -473,7 +602,7 @@ export default function OAuthModal({
       window.removeEventListener("storage", handleStorage);
       if (channel) channel.close();
     };
-  }, [authData, exchangeTokens]);
+  }, [authData, exchangeTokens, provider]);
 
   // Fix #344: Detect when OAuth popup is closed without completing authorization
   // Some providers (like Qoder) redirect to their own chat UI instead of sending a callback,
@@ -523,7 +652,10 @@ export default function OAuthModal({
   const handleManualSubmit = async () => {
     try {
       setError(null);
-
+      if (isCredentialBlob(callbackUrl)) {
+        await submitCredentialBlob(provider, callbackUrl, reauthConnection, setStep, onSuccess);
+        return;
+      }
       if (!authData) {
         throw new Error(
           "OAuth session not initialized. Restart the connection flow and try again."
@@ -569,160 +701,229 @@ export default function OAuthModal({
   if (!provider || !providerInfo) return null;
 
   return (
-    <Modal isOpen={isOpen} title={`Connect ${providerInfo.name}`} onClose={onClose} size="lg">
+    <Modal
+      isOpen={isOpen}
+      title={t("title", { providerName: providerInfo.name })}
+      onClose={onClose}
+      size="lg"
+    >
       <div className="flex flex-col gap-4">
-        {/* Waiting Step (Localhost - popup mode) */}
-        {step === "waiting" && !isDeviceCode && (
-          <div className="text-center py-6">
-            <div className="size-16 mx-auto mb-4 rounded-full bg-primary/10 flex items-center justify-center">
-              <span className="material-symbols-outlined text-3xl text-primary animate-spin">
-                progress_activity
-              </span>
-            </div>
-            <h3 className="text-lg font-semibold mb-2">Waiting for Authorization</h3>
-            <p className="text-sm text-text-muted mb-2">
-              Complete the authorization in the popup window.
-            </p>
-            <p className="text-xs text-text-muted mb-4 opacity-70">
-              If the popup closes without redirecting back (e.g. Qoder), this dialog will
-              automatically switch to manual URL input mode.
-            </p>
-            <Button variant="ghost" onClick={() => setStep("input")}>
-              Popup blocked? Enter URL manually
-            </Button>
+        {/* Paste-token tab toggle (Windsurf / Devin CLI only).
+            Phase 1 hotfix: when importTokenOnly is true, hide the entire toggle —
+            there is no "Browser Login" tab to switch to until Phase 2 ships. */}
+        {supportsTokenPaste && !importTokenOnly && step !== "success" && (
+          <div className="flex gap-2 border-b border-border pb-3">
+            <button
+              className={`text-sm px-3 py-1 rounded-t ${!showPasteToken ? "font-semibold border-b-2 border-primary text-primary" : "text-text-muted"}`}
+              onClick={() => setShowPasteToken(false)}
+            >
+              Browser Login
+            </button>
+            <button
+              className={`text-sm px-3 py-1 rounded-t ${showPasteToken ? "font-semibold border-b-2 border-primary text-primary" : "text-text-muted"}`}
+              onClick={() => setShowPasteToken(true)}
+            >
+              Paste API Key
+            </button>
           </div>
         )}
 
-        {/* Device Code Flow - Waiting */}
-        {step === "waiting" && isDeviceCode && deviceData && (
-          <>
-            <div className="text-center py-4">
-              <p className="text-sm text-text-muted mb-4">
-                Visit the URL below and enter the code:
-              </p>
-              <div className="bg-sidebar p-4 rounded-lg mb-4">
-                <p className="text-xs text-text-muted mb-1">Verification URL</p>
-                <div className="flex items-center gap-2">
-                  <code className="flex-1 text-sm break-all">{deviceData.verification_uri}</code>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    icon={copied === "verify_url" ? "check" : "content_copy"}
-                    onClick={() => copy(deviceData.verification_uri, "verify_url")}
-                  />
-                </div>
-              </div>
-              <div className="bg-primary/10 p-4 rounded-lg">
-                <p className="text-xs text-text-muted mb-1">Your Code</p>
-                <div className="flex items-center justify-center gap-2">
-                  <p className="text-2xl font-mono font-bold text-primary">
-                    {deviceData.user_code}
-                  </p>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    icon={copied === "user_code" ? "check" : "content_copy"}
-                    onClick={() => copy(deviceData.user_code, "user_code")}
-                  />
-                </div>
-              </div>
-            </div>
-            {polling && (
-              <div className="flex items-center justify-center gap-2 text-sm text-text-muted">
-                <span className="material-symbols-outlined animate-spin">progress_activity</span>
-                Waiting for authorization...
-              </div>
-            )}
-          </>
-        )}
-
-        {/* Manual Input Step */}
-        {step === "input" && !isDeviceCode && (
-          <>
-            <div className="space-y-4">
-              {/* Remote/LAN server info for Google OAuth providers */}
-              {!isTrueLocalhost && GOOGLE_OAUTH_PROVIDERS.has(provider) && (
-                <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
-                  <span className="material-symbols-outlined text-sm align-middle mr-1">
-                    warning
-                  </span>
-                  <strong>Remote access + Google OAuth:</strong> The default credentials only accept
-                  redirects to <code>localhost</code>. After authorizing, your browser will try to
-                  open <code>localhost</code> — copy that full URL and paste it below. For fully
-                  remote use without this manual step,{" "}
-                  <a
-                    href="https://github.com/diegosouzapw/OmniRoute#oauth-on-a-remote-server"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="underline"
-                  >
-                    configure your own OAuth credentials
-                  </a>
-                  .
-                </div>
-              )}
-              {/* Generic remote info for other providers */}
-              {!isTrueLocalhost && !GOOGLE_OAUTH_PROVIDERS.has(provider) && (
-                <div className="rounded-lg border border-blue-500/30 bg-blue-500/10 p-3 text-xs text-blue-200">
-                  <span className="material-symbols-outlined text-sm align-middle mr-1">info</span>
-                  <strong>Remote access:</strong> Since you&apos;re accessing OmniRoute remotely,
-                  after authorizing you&apos;ll see an error page (localhost not found). That&apos;s
-                  expected — just copy the full URL from your browser&apos;s address bar and paste
-                  it below.
-                </div>
-              )}
-              <div>
-                <p className="text-sm font-medium mb-2">Step 1: Open this URL in your browser</p>
-                <div className="flex gap-2">
-                  <Input
-                    value={authData?.authUrl || ""}
-                    readOnly
-                    className="flex-1 font-mono text-xs"
-                  />
-                  <Button
-                    variant="secondary"
-                    icon={copied === "auth_url" ? "check" : "content_copy"}
-                    onClick={() => copy(authData?.authUrl, "auth_url")}
-                  >
-                    Copy
-                  </Button>
-                </div>
-              </div>
-
-              <div>
-                <p className="text-sm font-medium mb-2">
-                  Step 2: Paste the callback URL or auth code here
-                </p>
-                <p className="text-xs text-text-muted mb-2">
-                  After authorization, paste the full callback URL. For Claude Code and Cline, you
-                  can also paste the Authentication Code directly, for example{" "}
-                  <code>code#state</code>.
-                </p>
-                <Input
-                  value={callbackUrl}
-                  onChange={(e) => setCallbackUrl(e.target.value)}
-                  placeholder={
-                    provider === "claude" || provider === "cline"
-                      ? "code#state or /callback?code=..."
-                      : placeholderUrl
-                  }
-                  className="font-mono text-xs"
-                />
-              </div>
-            </div>
-
+        {/* Paste-token form (Windsurf / Devin CLI) */}
+        {supportsTokenPaste && showPasteToken && step !== "success" && (
+          <div className="flex flex-col gap-3">
+            <p className="text-sm text-text-muted">
+              {provider === "windsurf"
+                ? 'In the Windsurf / VS Code IDE, run the "Windsurf: Provide Auth Token" command from the command palette (or click the Jupyter "Get Windsurf Authentication Token" button), then copy the shown token and paste it below. Opening windsurf.com/show-auth-token directly only shows a "Redirecting" page — the IDE must initiate the flow.'
+                : provider === "grok-cli"
+                  ? 'Paste your Grok Build JWT token from ~/.grok/auth.json (the "key" field value). You can get it by running `grok login` in your terminal.'
+                  : 'Provide your WINDSURF_API_KEY (obtained via `devin auth login`, or via the Windsurf IDE "Windsurf: Provide Auth Token" command).'}
+            </p>
+            <Input
+              value={pasteToken}
+              onChange={(e) => setPasteToken(e.target.value)}
+              placeholder={provider === "grok-cli" ? "eyJ..." : "ws-..."}
+              type="password"
+              label={provider === "grok-cli" ? "JWT Token" : "API Key / Token"}
+            />
+            {error && <p className="text-sm text-red-500">{error}</p>}
             <div className="flex gap-2">
-              <Button onClick={handleManualSubmit} fullWidth disabled={!callbackUrl || !authData}>
-                Connect
+              <Button
+                onClick={handleSaveToken}
+                fullWidth
+                disabled={!pasteToken.trim() || savingToken}
+              >
+                {savingToken ? "Saving…" : "Save Connection"}
               </Button>
               <Button onClick={onClose} variant="ghost" fullWidth>
                 Cancel
               </Button>
             </div>
+          </div>
+        )}
+
+        {/* OAuth flow steps — hidden when paste-token mode is active */}
+        {(!supportsTokenPaste || !showPasteToken) && (
+          <>
+            {/* Waiting Step (Localhost - popup mode) */}
+            {step === "waiting" && !isDeviceCode && (
+              <div className="text-center py-6">
+                <div className="size-16 mx-auto mb-4 rounded-full bg-primary/10 flex items-center justify-center">
+                  <span className="material-symbols-outlined text-3xl text-primary animate-spin">
+                    progress_activity
+                  </span>
+                </div>
+                <h3 className="text-lg font-semibold mb-2">{t("waiting")}</h3>
+                <p className="text-sm text-text-muted mb-2">{t("completeAuthInPopup")}</p>
+                <p className="text-xs text-text-muted mb-4 opacity-70">{t("popupClosedHint")}</p>
+                <Button variant="ghost" onClick={() => setStep("input")}>
+                  {t("popupBlocked")}
+                </Button>
+              </div>
+            )}
+
+            {/* Device Code Flow - Waiting */}
+            {step === "waiting" && isDeviceCode && deviceData && (
+              <>
+                <div className="text-center py-4">
+                  <p className="text-sm text-text-muted mb-4">{t("deviceCodeVisitUrl")}</p>
+                  <div className="bg-sidebar p-4 rounded-lg mb-4">
+                    <p className="text-xs text-text-muted mb-1">{t("deviceCodeVerificationUrl")}</p>
+                    <div className="flex items-center gap-2">
+                      <code className="flex-1 text-sm break-all">{deviceVerificationUrl}</code>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        icon={copied === "verify_url" ? "check" : "content_copy"}
+                        onClick={() => copy(deviceVerificationUrl, "verify_url")}
+                      />
+                    </div>
+                  </div>
+                  <div className="bg-primary/10 p-4 rounded-lg">
+                    <p className="text-xs text-text-muted mb-1">{t("deviceCodeYourCode")}</p>
+                    <div className="flex items-center justify-center gap-2">
+                      <p className="text-2xl font-mono font-bold text-primary">
+                        {deviceData.user_code}
+                      </p>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        icon={copied === "user_code" ? "check" : "content_copy"}
+                        onClick={() => copy(deviceData.user_code, "user_code")}
+                      />
+                    </div>
+                  </div>
+                </div>
+                {polling && (
+                  <div className="flex items-center justify-center gap-2 text-sm text-text-muted">
+                    <span className="material-symbols-outlined animate-spin">
+                      progress_activity
+                    </span>
+                    {t("deviceCodeWaiting")}
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* Manual Input Step */}
+            {step === "input" && !isDeviceCode && (
+              <>
+                <div className="space-y-4">
+                  {/* Remote/LAN server info for Google OAuth providers */}
+                  {!isTrueLocalhost && GOOGLE_OAUTH_PROVIDERS.has(provider) && (
+                    <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+                      <span className="material-symbols-outlined text-sm align-middle mr-1">
+                        warning
+                      </span>
+                      <strong>
+                        {t.rich("googleOAuthWarning", {
+                          code: (c) => <code className="font-mono">{c}</code>,
+                          a: (c) => (
+                            <a
+                              href="https://github.com/diegosouzapw/OmniRoute#oauth-on-a-remote-server"
+                              target="_blank"
+                              rel="noreferrer"
+                              className="underline"
+                            >
+                              {c}
+                            </a>
+                          ),
+                        })}
+                      </strong>
+                    </div>
+                  )}
+                  {/* Actionable remote paste instruction — shown for ALL remote providers,
+                      including Google OAuth (antigravity/agy). The Google
+                      loopback creds redirect to 127.0.0.1:<port>/callback, which on a
+                      remotely-accessed dashboard lands on the operator's own machine and
+                      shows a "can't reach this page" error. That is expected: the URL bar
+                      still carries ?code=…, and pasting it below completes the login. Before
+                      this, Google providers only saw the discouraging loopback warning and
+                      never the "copy the URL and paste it" step, so remote login appeared to
+                      hang. */}
+                  {!isTrueLocalhost && (
+                    <div className="rounded-lg border border-blue-500/30 bg-blue-500/10 p-3 text-xs text-blue-200">
+                      <span className="material-symbols-outlined text-sm align-middle mr-1">
+                        info
+                      </span>
+                      {t("remoteAccessInfo")}
+                    </div>
+                  )}
+                  <div>
+                    <p className="text-sm font-medium mb-2">{t("step1OpenUrl")}</p>
+                    <div className="flex gap-2">
+                      <Input
+                        value={authData?.authUrl || ""}
+                        readOnly
+                        className="flex-1 font-mono text-xs"
+                      />
+                      <Button
+                        variant="secondary"
+                        icon={copied === "auth_url" ? "check" : "content_copy"}
+                        onClick={() => copy(authData?.authUrl, "auth_url")}
+                      >
+                        {t("copy")}
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-sm font-medium mb-2">{t("step2PasteCallback")}</p>
+                    <p className="text-xs text-text-muted mb-2">
+                      {t.rich("step2Hint", {
+                        code: (c) => <code className="font-mono">{c}</code>,
+                      })}
+                    </p>
+                    <Input
+                      value={callbackUrl}
+                      onChange={(e) => setCallbackUrl(e.target.value)}
+                      placeholder={
+                        provider === "claude" || provider === "cline"
+                          ? "code#state or /callback?code=..."
+                          : placeholderUrl
+                      }
+                      className="font-mono text-xs"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex gap-2">
+                  <Button
+                    onClick={handleManualSubmit}
+                    fullWidth
+                    disabled={!callbackUrl || (!authData && !isCredentialBlob(callbackUrl))}
+                  >
+                    {t("connect")}
+                  </Button>
+                  <Button onClick={onClose} variant="ghost" fullWidth>
+                    {t("cancel")}
+                  </Button>
+                </div>
+              </>
+            )}
           </>
         )}
 
-        {/* Success Step */}
+        {/* Success Step — shown for both OAuth and paste-token flows */}
         {step === "success" && (
           <div className="text-center py-6">
             <div className="size-16 mx-auto mb-4 rounded-full bg-green-100 dark:bg-green-900/30 flex items-center justify-center">
@@ -730,30 +931,30 @@ export default function OAuthModal({
                 check_circle
               </span>
             </div>
-            <h3 className="text-lg font-semibold mb-2">Connected Successfully!</h3>
+            <h3 className="text-lg font-semibold mb-2">{t("success")}</h3>
             <p className="text-sm text-text-muted mb-4">
-              Your {providerInfo.name} account has been connected.
+              {t("successMessage", { providerName: providerInfo.name })}
             </p>
             <Button onClick={onClose} fullWidth>
-              Done
+              {t("done")}
             </Button>
           </div>
         )}
 
-        {/* Error Step */}
-        {step === "error" && (
+        {/* Error Step — OAuth errors only; paste-token errors shown inline */}
+        {step === "error" && !showPasteToken && (
           <div className="text-center py-6">
             <div className="size-16 mx-auto mb-4 rounded-full bg-red-100 dark:bg-red-900/30 flex items-center justify-center">
               <span className="material-symbols-outlined text-3xl text-red-600">error</span>
             </div>
-            <h3 className="text-lg font-semibold mb-2">Connection Failed</h3>
+            <h3 className="text-lg font-semibold mb-2">{t("error")}</h3>
             <p className="text-sm text-red-600 mb-4">{error}</p>
             <div className="flex gap-2">
               <Button onClick={startOAuthFlow} variant="secondary" fullWidth>
-                Try Again
+                {t("tryAgain")}
               </Button>
               <Button onClick={onClose} variant="ghost" fullWidth>
-                Cancel
+                {t("cancel")}
               </Button>
             </div>
           </div>
@@ -762,13 +963,3 @@ export default function OAuthModal({
     </Modal>
   );
 }
-
-OAuthModal.propTypes = {
-  isOpen: PropTypes.bool.isRequired,
-  provider: PropTypes.string,
-  providerInfo: PropTypes.shape({
-    name: PropTypes.string,
-  }),
-  onSuccess: PropTypes.func,
-  onClose: PropTypes.func.isRequired,
-};

@@ -2,7 +2,7 @@
  * SSE Logger — Thin wrapper around the shared Pino logger
  * for backward compatibility with existing SSE code.
  *
- * Migrated from console.log to structured Pino logging.
+ * Migrated from direct console logging to structured Pino logging.
  */
 import { createLogger, logger as rootLogger } from "@/shared/utils/logger";
 
@@ -39,9 +39,6 @@ export function response(status: number, duration: number, extra?: unknown) {
 export function stream(event: string, data?: unknown) {
   log.debug({ tag: "STREAM", event, ...spreadData(data) }, `🌊 ${event}`);
 }
-
-// Mask sensitive data (kept for backward compat; prefer shared maskKey)
-export { maskKey } from "@/shared/utils/formatting";
 
 // Helper to spread data into structured fields
 function spreadData(data: unknown): Record<string, unknown> {

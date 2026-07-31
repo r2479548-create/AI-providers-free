@@ -1,4 +1,4 @@
-import { CORS_ORIGIN, CORS_HEADERS } from "@/shared/utils/cors";
+import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import { callCloudWithMachineId } from "@/shared/utils/cloud";
 import { handleChat } from "@/sse/handlers/chat";
 import { initTranslators } from "@omniroute/open-sse/translator/index.ts";
@@ -25,24 +25,33 @@ function ensureInitialized() {
  * Handle CORS preflight
  */
 export async function OPTIONS() {
-  return new Response(null, {
-    headers: {
-      "Access-Control-Allow-Origin": CORS_ORIGIN,
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "*",
-    },
-  });
+  return handleCorsOptions();
 }
 
 export async function POST(request) {
   await ensureInitialized();
 
-  // Prompt injection guard — inspect body before forwarding
+  // One-line marker for diagnosing 413 / Server-Action interceptions.
+  // Logs only when Content-Length is present so debug noise stays low for
+  // typical chat payloads. Toggle off via OMNIROUTE_LOG_REQUEST_SHAPE=0.
+  if (process.env.OMNIROUTE_LOG_REQUEST_SHAPE !== "0") {
+    const ct = request.headers.get("content-type") ?? "";
+    const cl = request.headers.get("content-length");
+    if (cl && Number(cl) > 256 * 1024) {
+      console.error(`[CHAT-ROUTE] large body content-type="${ct}" content-length=${cl}`);
+    }
+  }
+
+  // Prompt injection guard — inspect body before forwarding. Parse the body ONCE here
+  // and thread it to handleChat so the handler does not JSON-parse the (often 270-550 KB)
+  // coding-agent payload a second time — the double parse doubled the body's heap
+  // residency on the hot path and fed the OOM crash-loop (#4380).
+  let parsedBody = null;
   try {
     const cloned = request.clone();
-    const body = await cloned.json().catch(() => null);
-    if (body) {
-      const { blocked, result } = injectionGuard(body);
+    parsedBody = await cloned.json().catch(() => null);
+    if (parsedBody) {
+      const { blocked, result } = injectionGuard(parsedBody);
       if (blocked) {
         return new Response(
           JSON.stringify({
@@ -59,17 +68,7 @@ export async function POST(request) {
     }
   } catch (error) {
     console.error("[SECURITY] Prompt injection guard failed:", error);
-    return new Response(
-      JSON.stringify({
-        error: {
-          message: "Security validation temporarily unavailable",
-          type: "security_guard_unavailable",
-          code: "SECURITY_002",
-        },
-      }),
-      { status: 503, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
-    );
   }
 
-  return await handleChat(request);
+  return await handleChat(request, null, parsedBody);
 }

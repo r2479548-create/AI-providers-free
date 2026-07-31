@@ -1,39 +1,90 @@
 "use client";
 
 import { useState, useMemo, useEffect } from "react";
-import PropTypes from "prop-types";
+import { useTranslations } from "next-intl";
 import Modal from "./Modal";
+import { buildPassthroughAliasModels } from "./modelSelectModalHelpers";
 import { getModelsByProviderId, PROVIDER_ID_TO_ALIAS } from "@/shared/constants/models";
 import { getCompatibleFallbackModels } from "@/lib/providers/managedAvailableModels";
 import {
+  getModelCatalogSourceLabel,
+  matchesModelCatalogQuery,
+  normalizeModelCatalogSource,
+} from "@/shared/utils/modelCatalogSearch";
+import {
   OAUTH_PROVIDERS,
-  FREE_PROVIDERS,
+  NOAUTH_PROVIDERS,
   APIKEY_PROVIDERS,
   isOpenAICompatibleProvider,
   isAnthropicCompatibleProvider,
 } from "@/shared/constants/providers";
 
-// Provider order: OAuth first, then Free, then API Key (matches dashboard/providers)
+// Provider order: OAuth first, then no-auth, then API Key (matches dashboard/providers)
 const PROVIDER_ORDER = [
   ...Object.keys(OAUTH_PROVIDERS),
-  ...Object.keys(FREE_PROVIDERS),
+  ...Object.keys(NOAUTH_PROVIDERS),
   ...Object.keys(APIKEY_PROVIDERS),
 ];
+
+type ModelSelectModalProps = {
+  isOpen: boolean;
+  onClose: () => void;
+  onSelect: (model: unknown) => void;
+  /**
+   * Optional toggle callback — when set, clicking a model already in
+   * `addedModelValues` invokes this instead of `onSelect`, so the modal acts
+   * as an in-place add/remove toggle. Ported from upstream PR
+   * decolua/9router#889 (Fajar Hidayat).
+   */
+  onDeselect?: (model: unknown) => void;
+  selectedModel?: string;
+  selectedModels?: string[];
+  activeProviders?: Array<{ provider: string; id?: string | number }>;
+  title?: string;
+  modelAliases?: Record<string, string>;
+  addedModelValues?: string[];
+  multiSelect?: boolean;
+  showCombos?: boolean;
+  alwaysIncludeProviders?: string[] | null;
+  /**
+   * When true, picking a model does NOT auto-close the modal — the caller must close
+   * explicitly. A "Done" button is rendered in the modal footer so the user has a clear
+   * way to confirm they are finished adding entries. Useful in combo creation, where the
+   * user typically adds several models in a row. Mutually exclusive with `multiSelect`
+   * (which renders its own Clear + Done footer driven by `selectedModels`).
+   * Inspired by upstream PR decolua/9router#1031. Combined with `onDeselect`, this also
+   * enables the toggle-style deselection from upstream PR decolua/9router#889.
+   */
+  keepOpenOnSelect?: boolean;
+};
 
 export default function ModelSelectModal({
   isOpen,
   onClose,
   onSelect,
+  onDeselect,
   selectedModel,
+  selectedModels = [],
   activeProviders = [],
-  title = "Select Model",
+  title,
   modelAliases = {},
   addedModelValues = [],
-}) {
+  multiSelect = false,
+  showCombos = true,
+  alwaysIncludeProviders = [],
+  keepOpenOnSelect = false,
+}: ModelSelectModalProps) {
+  const t = useTranslations("common");
+  const resolvedTitle = title ?? t("selectModel");
   const [searchQuery, setSearchQuery] = useState("");
   const [combos, setCombos] = useState<any[]>([]);
   const [providerNodes, setProviderNodes] = useState<any[]>([]);
   const [customModels, setCustomModels] = useState<Record<string, any>>({});
+  // Models discovered live from a custom provider's upstream `/models` endpoint,
+  // keyed by provider id. Merged into the alias/custom/fallback list below and
+  // tagged with the `auto` source badge. Ported from upstream PR
+  // decolua/9router#2018 (Hamsa_M).
+  const [fetchedModels, setFetchedModels] = useState<Record<string, any[]>>({});
 
   const fetchCombos = async () => {
     try {
@@ -83,10 +134,74 @@ export default function ModelSelectModal({
     if (isOpen) fetchCustomModels();
   }, [isOpen]);
 
+  // Fetch the live model catalog for one custom provider from its connection's
+  // upstream `/models` endpoint. Returns the model array, or null on any failure.
+  const fetchProviderModels = async (providerId: string): Promise<any[] | null> => {
+    try {
+      // Find the connection id for this provider — the route is keyed by connection.
+      const connection = activeProviders.find((p) => p.provider === providerId);
+      if (!connection?.id) return null;
+
+      const res = await fetch(`/api/providers/${connection.id}/models`);
+      if (!res.ok) {
+        console.warn(`Failed to fetch models for ${providerId}: ${res.status}`);
+        return null;
+      }
+      const data = await res.json();
+      return data.models || [];
+    } catch (error) {
+      console.error(`Error fetching models for ${providerId}:`, error);
+      return null;
+    }
+  };
+
+  // When the modal opens, dynamically load models for every connected custom
+  // (openai-/anthropic-compatible) provider in parallel.
+  useEffect(() => {
+    if (!isOpen) return;
+
+    let cancelled = false;
+
+    const loadCustomProviderModels = async () => {
+      const customProviderIds = activeProviders
+        .filter(
+          (p) =>
+            isOpenAICompatibleProvider(p.provider) || isAnthropicCompatibleProvider(p.provider)
+        )
+        .map((p) => p.provider);
+
+      if (customProviderIds.length === 0) return;
+
+      const fetched: Record<string, any[]> = {};
+      await Promise.all(
+        customProviderIds.map(async (providerId) => {
+          const models = await fetchProviderModels(providerId);
+          if (models && models.length > 1) {
+            fetched[providerId] = models;
+          }
+        })
+      );
+
+      if (!cancelled) setFetchedModels(fetched);
+    };
+
+    loadCustomProviderModels();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, activeProviders]);
+
   const allProviders = useMemo(
-    () => ({ ...OAUTH_PROVIDERS, ...FREE_PROVIDERS, ...APIKEY_PROVIDERS }),
+    () => ({ ...OAUTH_PROVIDERS, ...NOAUTH_PROVIDERS, ...APIKEY_PROVIDERS }),
     []
   );
+  const alwaysIncludeProvidersKey = Array.isArray(alwaysIncludeProviders)
+    ? alwaysIncludeProviders
+        .filter((providerId) => typeof providerId === "string" && providerId)
+        .join("\0")
+    : "";
 
   // Group models by provider with priority order
   const groupedModels = useMemo(() => {
@@ -94,10 +209,14 @@ export default function ModelSelectModal({
 
     // Get all active provider IDs from connections
     const activeConnectionIds = activeProviders.map((p) => p.provider);
+    const explicitProviderIds = alwaysIncludeProvidersKey
+      ? alwaysIncludeProvidersKey.split("\0")
+      : [];
 
     // Only show connected providers (including both standard and custom)
     const providerIdsToShow = new Set([
-      ...activeConnectionIds, // Only connected providers
+      ...activeConnectionIds, // Connected providers
+      ...explicitProviderIds, // Zero-config providers required by specific clients
     ]);
 
     // Sort by PROVIDER_ORDER
@@ -117,13 +236,14 @@ export default function ModelSelectModal({
       const providerCustomModels = customModels[providerId] || [];
 
       if (providerInfo.passthroughModels) {
-        const aliasModels = Object.entries(modelAliases as Record<string, string>)
-          .filter(([, fullModel]: [string, string]) => fullModel.startsWith(`${alias}/`))
-          .map(([aliasName, fullModel]: [string, string]) => ({
-            id: fullModel.replace(`${alias}/`, ""),
-            name: aliasName,
-            value: fullModel,
-          }));
+        // Passthrough aliases are stored prefixed by the canonical providerId
+        // (e.g. "github/gpt-4"), not the public alias (e.g. "gh/"), so we must
+        // filter/strip by providerId — matching the sibling custom-provider
+        // branch below. (port: decolua/9router#485)
+        const aliasModels = buildPassthroughAliasModels(
+          modelAliases as Record<string, string>,
+          providerId
+        );
 
         // Merge custom models for passthrough providers
         const customEntries = providerCustomModels
@@ -133,6 +253,7 @@ export default function ModelSelectModal({
             name: cm.name || cm.id,
             value: `${alias}/${cm.id}`,
             isCustom: true,
+            source: normalizeModelCatalogSource(cm.source) === "imported" ? "imported" : "custom",
           }));
 
         const allModels = [...aliasModels, ...customEntries];
@@ -159,6 +280,7 @@ export default function ModelSelectModal({
             id: fullModel.replace(`${providerId}/`, ""),
             name: aliasName,
             value: `${nodePrefix}/${fullModel.replace(`${providerId}/`, "")}`,
+            source: "alias",
           }));
 
         const fallbackEntries = (
@@ -170,6 +292,7 @@ export default function ModelSelectModal({
             name: fm.name || fm.id,
             value: `${nodePrefix}/${fm.id}`,
             isFallback: true,
+            source: "fallback",
           }));
 
         // Merge custom models for custom providers
@@ -184,9 +307,32 @@ export default function ModelSelectModal({
             name: cm.name || cm.id,
             value: `${nodePrefix}/${cm.id}`,
             isCustom: true,
+            source: normalizeModelCatalogSource(cm.source) === "imported" ? "imported" : "custom",
           }));
 
-        const allModels = [...nodeModels, ...fallbackEntries, ...customEntries];
+        // Models discovered live from the provider's upstream `/models` endpoint.
+        // Deduped against alias, fallback, and user-added custom models; tagged
+        // with the `auto` source so the badge reads "auto".
+        const fetchedEntries = (fetchedModels[providerId] || [])
+          .map((m) => {
+            const id = m.id || m.slug || m.model || m.name;
+            return {
+              id,
+              name: m.name || m.displayName || id,
+              value: `${nodePrefix}/${id}`,
+              isFetched: true,
+              source: "auto",
+            };
+          })
+          .filter(
+            (fm) =>
+              fm.id &&
+              !nodeModels.some((nm) => nm.id === fm.id) &&
+              !fallbackEntries.some((fbm) => fbm.id === fm.id) &&
+              !customEntries.some((cm) => cm.id === fm.id)
+          );
+
+        const allModels = [...nodeModels, ...fallbackEntries, ...customEntries, ...fetchedEntries];
 
         if (allModels.length > 0) {
           groups[providerId] = {
@@ -206,6 +352,7 @@ export default function ModelSelectModal({
           id: m.id,
           name: m.name,
           value: `${alias}/${m.id}`,
+          source: "system",
         }));
 
         const customEntries = providerCustomModels
@@ -215,6 +362,7 @@ export default function ModelSelectModal({
             name: cm.name || cm.id,
             value: `${alias}/${cm.id}`,
             isCustom: true,
+            source: normalizeModelCatalogSource(cm.source) === "imported" ? "imported" : "custom",
           }));
 
         const allModels = [...systemEntries, ...customEntries];
@@ -231,7 +379,15 @@ export default function ModelSelectModal({
     });
 
     return groups;
-  }, [activeProviders, modelAliases, allProviders, providerNodes, customModels]);
+  }, [
+    activeProviders,
+    alwaysIncludeProvidersKey,
+    modelAliases,
+    allProviders,
+    providerNodes,
+    customModels,
+    fetchedModels,
+  ]);
 
   // Filter combos by search query
   const filteredCombos = useMemo(() => {
@@ -248,8 +404,12 @@ export default function ModelSelectModal({
     const filtered: Record<string, any> = {};
 
     Object.entries(groupedModels).forEach(([providerId, group]: [string, any]) => {
-      const matchedModels = group.models.filter(
-        (m) => m.name.toLowerCase().includes(query) || m.id.toLowerCase().includes(query)
+      const matchedModels = group.models.filter((model) =>
+        matchesModelCatalogQuery(query, {
+          modelId: model.id,
+          modelName: model.name,
+          source: model.source,
+        })
       );
 
       const providerNameMatches = group.name.toLowerCase().includes(query);
@@ -257,7 +417,7 @@ export default function ModelSelectModal({
       if (matchedModels.length > 0 || providerNameMatches) {
         filtered[providerId] = {
           ...group,
-          models: matchedModels,
+          models: matchedModels.length > 0 ? matchedModels : group.models,
         };
       }
     });
@@ -265,11 +425,58 @@ export default function ModelSelectModal({
     return filtered;
   }, [groupedModels, searchQuery]);
 
+  const resolvedSelectedModels = multiSelect
+    ? selectedModels
+    : selectedModel
+      ? [selectedModel]
+      : [];
+
+  const isValueSelected = (value: string) => resolvedSelectedModels.includes(value);
+
   const handleSelect = (model: any) => {
-    onSelect(model);
-    onClose();
-    setSearchQuery("");
+    // Upstream PR decolua/9router#889: when the model is already in
+    // `addedModelValues` AND a deselect callback was supplied, the click acts
+    // as an in-place remove instead of a duplicate add.
+    const candidateValue =
+      typeof model?.value === "string"
+        ? model.value
+        : typeof model?.name === "string"
+          ? model.name
+          : typeof model === "string"
+            ? model
+            : "";
+    const isAdded = candidateValue ? addedModelValues.includes(candidateValue) : false;
+
+    if (isAdded && onDeselect) {
+      onDeselect(model);
+    } else {
+      onSelect(model);
+    }
+
+    // Legacy single-pick auto-closes; multiSelect or keepOpenOnSelect keep the
+    // modal open so the user can toggle several entries in a row.
+    if (!multiSelect && !keepOpenOnSelect) {
+      onClose();
+      setSearchQuery("");
+    }
   };
+
+  // Footer "Done" button for single-select callers that opted out of auto-close
+  // (e.g. combo creation, where users add several models in a row). Skipped when
+  // `multiSelect` is on — that mode renders its own Clear + Done footer below the body.
+  const doneFooter =
+    keepOpenOnSelect && !multiSelect ? (
+      <button
+        type="button"
+        onClick={() => {
+          onClose();
+          setSearchQuery("");
+        }}
+        className="w-full px-3 py-2 text-sm font-medium rounded border border-primary bg-primary text-white hover:bg-primary/90 transition-colors"
+      >
+        {t("done")}
+      </button>
+    ) : null;
 
   return (
     <Modal
@@ -278,9 +485,10 @@ export default function ModelSelectModal({
         onClose();
         setSearchQuery("");
       }}
-      title={title}
+      title={resolvedTitle}
       size="md"
       className="p-4!"
+      footer={doneFooter}
     >
       {/* Search - compact */}
       <div className="mb-3">
@@ -290,7 +498,7 @@ export default function ModelSelectModal({
           </span>
           <input
             type="text"
-            placeholder="Search..."
+            placeholder={t("search")}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full pl-8 pr-3 py-1.5 bg-surface border border-border rounded text-xs focus:outline-none focus:ring-1 focus:ring-primary/50"
@@ -301,16 +509,16 @@ export default function ModelSelectModal({
       {/* Models grouped by provider - compact */}
       <div className="max-h-[300px] overflow-y-auto space-y-3">
         {/* Combos section - always first */}
-        {filteredCombos.length > 0 && (
+        {showCombos && filteredCombos.length > 0 && (
           <div>
             <div className="flex items-center gap-1.5 mb-1.5 sticky top-0 bg-surface py-0.5">
               <span className="material-symbols-outlined text-primary text-[14px]">layers</span>
-              <span className="text-xs font-medium text-primary">Combos</span>
+              <span className="text-xs font-medium text-primary">{t("combos")}</span>
               <span className="text-[10px] text-text-muted">({filteredCombos.length})</span>
             </div>
             <div className="flex flex-wrap gap-1.5">
               {filteredCombos.map((combo) => {
-                const isSelected = selectedModel === combo.name;
+                const isSelected = isValueSelected(combo.name);
                 return (
                   <button
                     key={combo.id}
@@ -346,7 +554,7 @@ export default function ModelSelectModal({
 
             <div className="flex flex-wrap gap-1.5">
               {group.models.map((model) => {
-                const isSelected = selectedModel === model.value;
+                const isSelected = isValueSelected(model.value);
                 const isAdded = addedModelValues.includes(model.value);
                 return (
                   <button
@@ -365,7 +573,11 @@ export default function ModelSelectModal({
                   >
                     {isAdded && <span className="mr-0.5 opacity-70">✓</span>}
                     {model.name}
-                    {model.isCustom ? " ★" : ""}
+                    {model.source && (
+                      <span className="ml-1 text-[10px] uppercase opacity-70">
+                        {getModelCatalogSourceLabel(model.source)}
+                      </span>
+                    )}
                   </button>
                 );
               })}
@@ -376,25 +588,34 @@ export default function ModelSelectModal({
         {Object.keys(filteredGroups).length === 0 && filteredCombos.length === 0 && (
           <div className="text-center py-4 text-text-muted">
             <span className="material-symbols-outlined text-2xl mb-1 block">search_off</span>
-            <p className="text-xs">No models found</p>
+            <p className="text-xs">{t("noModelsFound")}</p>
           </div>
         )}
       </div>
+      {multiSelect && (
+        <div className="mt-4 flex items-center justify-between gap-2 border-t border-border pt-3">
+          <span className="text-xs text-text-muted">{resolvedSelectedModels.length} selected</span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => onSelect(null)}
+              className="px-2 py-1 text-xs rounded border border-border bg-surface hover:bg-primary/5"
+            >
+              {t("clear")}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                onClose();
+                setSearchQuery("");
+              }}
+              className="px-2 py-1 text-xs rounded border border-border bg-surface hover:bg-primary/5"
+            >
+              {t("done")}
+            </button>
+          </div>
+        </div>
+      )}
     </Modal>
   );
 }
-
-ModelSelectModal.propTypes = {
-  isOpen: PropTypes.bool.isRequired,
-  onClose: PropTypes.func.isRequired,
-  onSelect: PropTypes.func.isRequired,
-  selectedModel: PropTypes.string,
-  activeProviders: PropTypes.arrayOf(
-    PropTypes.shape({
-      provider: PropTypes.string.isRequired,
-    })
-  ),
-  title: PropTypes.string,
-  modelAliases: PropTypes.object,
-  addedModelValues: PropTypes.arrayOf(PropTypes.string),
-};

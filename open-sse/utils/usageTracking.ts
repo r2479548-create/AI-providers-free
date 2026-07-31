@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Token Usage Tracking - Extract, normalize, estimate and log token usage
  */
@@ -90,6 +91,16 @@ async function _loadBufferFromDb(): Promise<void> {
 export function invalidateBufferTokensCache(): void {
   _cachedBuffer = null;
   _cacheTimestamp = 0;
+}
+
+/**
+ * Directly set the cached buffer value — called by runtimeSettings after a
+ * settings save so the new value is available synchronously on the next request
+ * (no race window between invalidation and the async DB re-read).
+ */
+export function setBufferTokensCache(value: number): void {
+  _cachedBuffer = value;
+  _cacheTimestamp = Date.now();
 }
 
 // Get HH:MM:SS timestamp
@@ -226,7 +237,7 @@ export function filterUsageForFormat(usage, targetFormat) {
   let fields = formatFields[targetFormat];
 
   // Use same fields for similar formats
-  if (targetFormat === FORMATS.GEMINI_CLI || targetFormat === FORMATS.ANTIGRAVITY) {
+  if (targetFormat === FORMATS.ANTIGRAVITY) {
     fields = formatFields[FORMATS.GEMINI];
   } else if (targetFormat === FORMATS.OPENAI_RESPONSE) {
     fields = formatFields[FORMATS.OPENAI_RESPONSES];
@@ -253,6 +264,8 @@ export function normalizeUsage(usage) {
   assignNumber("prompt_tokens", usage?.prompt_tokens);
   assignNumber("completion_tokens", usage?.completion_tokens);
   assignNumber("total_tokens", usage?.total_tokens);
+  assignNumber("input_tokens", usage?.input_tokens);
+  assignNumber("output_tokens", usage?.output_tokens);
   assignNumber("cache_read_input_tokens", usage?.cache_read_input_tokens);
   assignNumber("cache_creation_input_tokens", usage?.cache_creation_input_tokens);
   assignNumber("cached_tokens", usage?.cached_tokens);
@@ -312,6 +325,8 @@ export function extractUsage(chunk) {
       return normalizeUsage({
         prompt_tokens: inputTokens + cacheRead + cacheCreation,
         completion_tokens: u.output_tokens || u.completion_tokens || 0,
+        input_tokens: inputTokens + cacheRead + cacheCreation,
+        output_tokens: u.output_tokens || u.completion_tokens || 0,
         cache_read_input_tokens: u.cache_read_input_tokens,
         cache_creation_input_tokens: u.cache_creation_input_tokens,
       });
@@ -326,6 +341,8 @@ export function extractUsage(chunk) {
     return normalizeUsage({
       prompt_tokens: deltaInput + deltaCacheRead + deltaCacheCreation,
       completion_tokens: chunk.usage.output_tokens || 0,
+      input_tokens: deltaInput + deltaCacheRead + deltaCacheCreation,
+      output_tokens: chunk.usage.output_tokens || 0,
       cache_read_input_tokens: chunk.usage.cache_read_input_tokens,
       cache_creation_input_tokens: chunk.usage.cache_creation_input_tokens,
     });
@@ -341,8 +358,15 @@ export function extractUsage(chunk) {
     return normalizeUsage({
       prompt_tokens: usage.input_tokens || usage.prompt_tokens || 0,
       completion_tokens: usage.output_tokens || usage.completion_tokens || 0,
-      cached_tokens: usage.input_tokens_details?.cached_tokens,
-      reasoning_tokens: usage.output_tokens_details?.reasoning_tokens,
+      cached_tokens:
+        usage.input_tokens_details?.cached_tokens ??
+        usage.prompt_tokens_details?.cached_tokens ??
+        usage.cache_read_input_tokens,
+      cache_creation_input_tokens: usage.cache_creation_input_tokens,
+      reasoning_tokens:
+        usage.output_tokens_details?.reasoning_tokens ??
+        usage.completion_tokens_details?.reasoning_tokens ??
+        usage.reasoning_tokens,
     });
   }
 
@@ -355,19 +379,42 @@ export function extractUsage(chunk) {
     return normalizeUsage({
       prompt_tokens: chunk.usage.prompt_tokens ?? chunk.usage.input_tokens ?? 0,
       completion_tokens: chunk.usage.completion_tokens ?? chunk.usage.output_tokens ?? 0,
-      cached_tokens: chunk.usage.prompt_tokens_details?.cached_tokens,
-      reasoning_tokens: chunk.usage.completion_tokens_details?.reasoning_tokens,
+      cached_tokens:
+        chunk.usage.prompt_tokens_details?.cached_tokens ??
+        chunk.usage.input_tokens_details?.cached_tokens ??
+        chunk.usage.prompt_cache_hit_tokens ??
+        chunk.usage.cached_tokens,
+      reasoning_tokens:
+        chunk.usage.completion_tokens_details?.reasoning_tokens ??
+        chunk.usage.output_tokens_details?.reasoning_tokens ??
+        chunk.usage.reasoning_tokens,
     });
   }
 
   // Gemini format (Antigravity)
-  if (chunk.usageMetadata && typeof chunk.usageMetadata === "object") {
+  // Antigravity wraps usageMetadata inside a `response` envelope:
+  // { response: { usageMetadata: {...} } } — fall back to it so AG-shaped
+  // chunks do not silently drop token usage.
+  const usageMeta = chunk.usageMetadata || chunk.response?.usageMetadata;
+  if (usageMeta && typeof usageMeta === "object") {
     return normalizeUsage({
-      prompt_tokens: chunk.usageMetadata?.promptTokenCount || 0,
-      completion_tokens: chunk.usageMetadata?.candidatesTokenCount || 0,
-      total_tokens: chunk.usageMetadata?.totalTokenCount,
-      cached_tokens: chunk.usageMetadata?.cachedContentTokenCount,
-      reasoning_tokens: chunk.usageMetadata?.thoughtsTokenCount,
+      prompt_tokens: usageMeta.promptTokenCount || 0,
+      completion_tokens: usageMeta.candidatesTokenCount || 0,
+      total_tokens: usageMeta.totalTokenCount,
+      cached_tokens: usageMeta.cachedContentTokenCount,
+      reasoning_tokens: usageMeta.thoughtsTokenCount,
+    });
+  }
+
+  // Ollama NDJSON format (raw from provider, before translation)
+  // Ollama sends: { "model": "...", "done": true, "prompt_eval_count": N, "eval_count": M }
+  if (chunk.done === true && typeof chunk.prompt_eval_count === "number") {
+    const promptEvalCount = chunk.prompt_eval_count || 0;
+    const evalCount = chunk.eval_count || 0;
+    return normalizeUsage({
+      prompt_tokens: promptEvalCount,
+      completion_tokens: evalCount,
+      total_tokens: promptEvalCount + evalCount,
     });
   }
 
@@ -489,7 +536,13 @@ export function estimateUsage(body, contentLength, targetFormat = FORMATS.OPENAI
 /**
  * Log usage with cache info (green color)
  */
-export function logUsage(provider, usage, model = null, connectionId = null, apiKeyInfo = null) {
+export function logUsage(
+  provider,
+  usage,
+  model: string | null = null,
+  connectionId: string | null = null,
+  apiKeyInfo = null
+) {
   if (!usage || typeof usage !== "object") return;
 
   const p = provider?.toUpperCase() || "UNKNOWN";
@@ -499,7 +552,11 @@ export function logUsage(provider, usage, model = null, connectionId = null, api
   // - Claude: input_tokens, output_tokens
   const inTokens = getLoggedInputTokens(usage);
   const outTokens = getLoggedOutputTokens(usage);
-  const accountPrefix = connectionId ? connectionId.slice(0, 8) + "..." : "unknown";
+  void apiKeyInfo;
+  const normalizedConnectionId = typeof connectionId === "string" ? connectionId : undefined;
+  const accountPrefix = normalizedConnectionId
+    ? normalizedConnectionId.slice(0, 8) + "..."
+    : "unknown";
 
   let msg = `[${getTimeString()}] 📊 ${COLORS.green}[USAGE] ${p} | in=${inTokens} | out=${outTokens} | account=${accountPrefix}${COLORS.reset}`;
 
@@ -529,5 +586,11 @@ export function logUsage(provider, usage, model = null, connectionId = null, api
     cacheCreation: cacheCreation || 0,
     reasoning: reasoning || 0,
   };
-  appendRequestLog({ model, provider, connectionId, tokens, status: "200 OK" }).catch(() => {});
+  appendRequestLog({
+    model: typeof model === "string" ? model : undefined,
+    provider: typeof provider === "string" ? provider : undefined,
+    connectionId: normalizedConnectionId,
+    tokens,
+    status: "200 OK",
+  }).catch(() => {});
 }

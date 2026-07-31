@@ -1,6 +1,7 @@
 import { request as undiciRequest } from "undici";
 import {
   createProxyDispatcher,
+  isRelayType,
   isSocks5ProxyEnabled,
   proxyConfigToUrl,
   proxyUrlForLogs,
@@ -9,14 +10,14 @@ import { testProxySchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { createErrorResponse, createErrorResponseFromUnknown } from "@/lib/api/errorResponse";
 import { getProxyById } from "@/lib/localDb";
+import { extractRelayAuth } from "@/lib/db/proxies";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 const BASE_SUPPORTED_PROXY_TYPES = new Set(["http", "https"]);
 
 function getErrorMessage(error: unknown, fallbackMessage: string): string {
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-  return fallbackMessage;
+  return sanitizeErrorMessage(error) || fallbackMessage;
 }
 
 function getSupportedProxyTypes() {
@@ -36,6 +37,9 @@ function supportedTypesMessage() {
  * Returns: { success, publicIp?, latencyMs?, error? }
  */
 export async function POST(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   let rawBody: unknown;
   try {
     rawBody = await request.json();
@@ -64,6 +68,7 @@ export async function POST(request: Request) {
     // the actual secrets for testing.
     const body = rawBody as Record<string, unknown>;
     const proxyId = typeof body.proxyId === "string" ? body.proxyId.trim() : null;
+    let dbProxyNotes: string | null = null;
     if (proxyId) {
       const dbProxy = await getProxyById(proxyId, { includeSecrets: true });
       if (dbProxy) {
@@ -75,10 +80,68 @@ export async function POST(request: Request) {
           username: dbProxy.username,
           password: dbProxy.password,
         };
+        dbProxyNotes = dbProxy.notes ?? null;
       }
     }
 
     const proxyType = String(proxy.type || "http").toLowerCase();
+
+    // Relay proxies (Vercel / Deno / Cloudflare): test by hitting ipify via the
+    // relay headers. All three share the same x-relay-* header contract; the
+    // only difference is the deployed edge target (#5128 — Deno/Cloudflare were
+    // previously rejected here as unsupported proxy types).
+    if (isRelayType(proxyType)) {
+      const relayHost = proxy.host;
+      // relayAuth lives in notes JSON, written by the deploy routes as either a
+      // plaintext { relayAuth } or, on installs with STORAGE_ENCRYPTION_KEY, an
+      // encrypted { relayAuthEnc }. extractRelayAuth handles both (#5128 — the
+      // encrypted form was previously ignored, leaving relayAuth empty → 401).
+      let relayAuth = extractRelayAuth(dbProxyNotes) ?? "";
+      // Fallback: ad-hoc callers may pass relayAuth in the password field
+      if (!relayAuth) relayAuth = proxy.password ?? "";
+      const relayUrl = `https://${relayHost}`;
+      const start = Date.now();
+      const controller2 = new AbortController();
+      const timeout2 = setTimeout(() => controller2.abort(), 10000);
+      try {
+        // Send request to the relay URL with relay headers; relay forwards to ipify
+        const res = await undiciRequest(`${relayUrl}/`, {
+          method: "GET",
+          signal: controller2.signal,
+          headersTimeout: 10000,
+          bodyTimeout: 10000,
+          headers: {
+            "x-relay-target": "https://api64.ipify.org",
+            "x-relay-path": "/?format=json",
+            "x-relay-auth": relayAuth,
+          },
+        });
+        const text = await res.body.text();
+        let parsedIp: { ip?: string } = {};
+        try {
+          parsedIp = JSON.parse(text) as { ip?: string };
+        } catch {}
+        return Response.json({
+          success: res.statusCode === 200,
+          publicIp: parsedIp.ip || null,
+          latencyMs: Date.now() - start,
+          proxyUrl: relayUrl,
+        });
+      } catch (relayErr) {
+        return Response.json({
+          success: false,
+          error:
+            relayErr instanceof Error && relayErr.name === "AbortError"
+              ? "Connection timeout (10s)"
+              : getErrorMessage(relayErr, "Relay test failed"),
+          latencyMs: Date.now() - start,
+          proxyUrl: relayUrl,
+        });
+      } finally {
+        clearTimeout(timeout2);
+      }
+    }
+
     if (proxyType === "socks5" && !isSocks5ProxyEnabled()) {
       return createErrorResponse({
         status: 400,
@@ -137,7 +200,7 @@ export async function POST(request: Request) {
     const dispatcher = createProxyDispatcher(proxyUrl);
 
     try {
-      const result = await undiciRequest("https://api.ipify.org?format=json", {
+      const result = await undiciRequest("https://api64.ipify.org?format=json", {
         method: "GET",
         dispatcher,
         signal: controller.signal,

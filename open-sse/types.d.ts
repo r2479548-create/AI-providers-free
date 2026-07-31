@@ -17,6 +17,8 @@ export interface ProviderCredentials {
   refreshToken?: string;
   /** Internal connection ID */
   connectionId: string;
+  /** Optional per-account concurrency cap */
+  maxConcurrent?: number | null;
   /** User email associated with the connection */
   email?: string;
   /** API key (for apikey auth type) */
@@ -28,7 +30,7 @@ export interface ProviderCredentials {
 }
 
 export interface ModelInfo {
-  /** Canonical provider ID (e.g., "claude", "gemini-cli") */
+  /** Canonical provider ID (e.g., "claude", "antigravity") */
   provider: string;
   /** Model identifier (e.g., "claude-opus-4-6") */
   model: string;

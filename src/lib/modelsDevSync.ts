@@ -153,13 +153,17 @@ const MODELS_DEV_PROVIDER_MAP: Record<string, string[]> = {
   // Major providers
   openai: ["openai", "cx"], // cx = Codex (uses OpenAI models)
   anthropic: ["anthropic", "cc"], // cc = Claude Code
-  google: ["gemini", "gemini-cli"],
+  google: ["gemini"],
+  "google-vertex": ["gemini", "vertex"],
+  "google-vertex-anthropic": ["anthropic", "cc", "vertex"],
   vertex_ai: ["gemini", "vertex"],
   deepseek: ["deepseek", "if"], // if = Qoder (routes through DeepSeek)
   groq: ["groq"],
   xai: ["xai"],
   mistral: ["mistral"],
+  togetherai: ["together", "openrouter"],
   together_ai: ["together", "openrouter"],
+  "fireworks-ai": ["fireworks"],
   fireworks: ["fireworks"],
   cerebras: ["cerebras"],
   cohere: ["cohere"],
@@ -172,11 +176,34 @@ const MODELS_DEV_PROVIDER_MAP: Record<string, string[]> = {
   perplexity: ["pplx", "perplexity"],
   // OAuth / special providers
   bedrock: ["kiro", "kr"], // kr = Kiro (AWS Bedrock)
+  "github-copilot": ["github", "gh"],
+  "github-models": ["github", "gh"],
+  kilo: ["kilocode", "kc", "kilo-gateway"],
+  kilocode: ["kilocode", "kc", "kilo-gateway"],
+  "kimi-for-coding": ["kimi-coding", "kmc", "kimi-coding-apikey", "kmca"],
+  // The `opencode` models.dev entry used to map only to "opencode-zen" because
+  // that is the historical alias pair. But OmniRoute's catalog & combo targets
+  // reference models under BOTH provider IDs:
+  //   - `opencode-zen/big-pickle` (alias form)
+  //   - `opencode/big-pickle`    (canonical id form, used by live API catalog
+  //                               and by combos like "Opencode FREE Omni")
+  // If we only store synced capabilities under "opencode-zen", the canonical
+  // `opencode/<model>` lookup in getCanonicalModelMetadata returns null and
+  // any combo that targets `opencode/...` ends up with no computed context.
+  // Symmetric mapping keeps both lookup paths populated.
+  opencode: ["opencode", "opencode-zen"],
+  "opencode-go": ["opencode-go", "opencode-zen"],
   // Additional providers that may overlap with OmniRoute
-  alibaba: ["ali", "alibaba", "bcp", "alicode", "alicode-intl"],
+  alibaba: ["ali", "alibaba"],
+  "alibaba-cn": ["ali-cn", "alibaba-cn", "alibaba-china"],
+  "alibaba-coding-plan": ["bcp", "bailian-coding-plan"],
   zai: ["zai", "glm"], // GLM models via Z.AI
+  "zai-coding-plan": ["zai", "glm"],
+  moonshotai: ["moonshot", "kimi"],
+  "moonshotai-cn": ["moonshot", "kimi"],
   moonshot: ["moonshot", "kimi", "kimi-coding", "kmc", "kmca"],
   minimax: ["minimax", "minimax-cn"],
+  "minimax-cn": ["minimax-cn"],
   longcat: ["lc", "longcat"],
   pollinations: ["pol", "pollinations"],
   puter: ["pu", "puter"],
@@ -184,7 +211,6 @@ const MODELS_DEV_PROVIDER_MAP: Record<string, string[]> = {
   scaleway: ["scw"],
   ollama: ["ollamacloud", "ollama-cloud"],
   blackbox: ["bb", "blackbox"],
-  kilocode: ["kc", "kilocode"],
   cline: ["cl", "cline"],
   cursor: ["cu", "cursor"],
   github: ["gh", "github"],
@@ -202,6 +228,9 @@ export function mapProviderId(modelsDevProviderId: string): string[] {
 // ─── Periodic sync state ─────────────────────────────────
 
 let syncTimer: ReturnType<typeof setInterval> | null = null;
+let activeSyncAbortController: AbortController | null = null;
+let activeSyncPromise: Promise<SyncResult> | null = null;
+let activePeriodicSyncToken: { stopped: boolean } | null = null;
 let lastSyncTime: string | null = null;
 let lastSyncModelCount = 0;
 let lastSyncCapabilityCount = 0;
@@ -211,6 +240,48 @@ let cacheTime = 0;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 let cachedCapabilities: CapabilitiesByProvider | null = null;
 let cachedCapabilitiesLoadedAll = false;
+const MODELS_DEV_ABORT_ERROR = "AbortError";
+
+function createAbortError(): Error {
+  const error = new Error("models.dev sync aborted");
+  error.name = MODELS_DEV_ABORT_ERROR;
+  return error;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === MODELS_DEV_ABORT_ERROR;
+}
+
+function createAbortedSyncResult(dryRun: boolean): SyncResult {
+  return {
+    success: false,
+    modelCount: 0,
+    providerCount: 0,
+    capabilityCount: 0,
+    dryRun,
+    error: "aborted",
+  };
+}
+
+async function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+
+    const onAbort = () => {
+      clearTimeout(timeout);
+      reject(createAbortError());
+    };
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 // ─── Core: Fetch ─────────────────────────────────────────
 
@@ -218,14 +289,14 @@ let cachedCapabilitiesLoadedAll = false;
  * Fetch raw data from models.dev API.
  * Uses in-memory cache with 24h TTL to avoid repeated fetches.
  */
-export async function fetchModelsDev(): Promise<ModelsDevData> {
+export async function fetchModelsDev(signal?: AbortSignal): Promise<ModelsDevData> {
   // Return cached data if still fresh
   if (cachedData && Date.now() - cacheTime < CACHE_TTL_MS) {
     return cachedData;
   }
 
   const response = await fetch(MODELS_DEV_API_URL, {
-    signal: AbortSignal.timeout(30000),
+    signal: signal ?? AbortSignal.timeout(30000),
   });
   if (!response.ok) {
     throw new Error(`models.dev fetch failed [${response.status}]: ${response.statusText}`);
@@ -506,23 +577,65 @@ export function getSyncedCapabilities(provider?: string, modelId?: string): Capa
   return result;
 }
 
+/**
+ * Resolved providers/aliases to also try when looking up a synced capability.
+ * Required because models.dev has historically stored capability rows under the
+ * alias side of an alias pair (e.g. "opencode-zen") while the catalog & combo
+ * targets reference the canonical id (e.g. "opencode"). Without this fallback,
+ * combos whose targets use the canonical id (e.g. "Opencode FREE Omni" → all
+ * `opencode/...` models) end up with `context_length: null` in the catalog.
+ */
+const SYNCED_CAPABILITY_FALLBACK_ALIASES: Record<string, string[]> = {
+  opencode: ["opencode-zen"],
+  "opencode-zen": ["opencode"],
+  "opencode-go": ["opencode-zen"],
+};
+
 export function getSyncedCapability(
   provider: string,
   modelId: string
 ): ModelCapabilityEntry | null {
   if (!provider || !modelId) return null;
 
+  // Fast path: every provider is in the in-memory cache, skip SQLite entirely.
   if (cachedCapabilitiesLoadedAll) {
-    return cachedCapabilities?.[provider]?.[modelId] ?? null;
+    const lookupCached = (p: string) => cachedCapabilities?.[p]?.[modelId] ?? null;
+    const directCached = lookupCached(provider);
+    if (directCached) return directCached;
+    const fallbacks = SYNCED_CAPABILITY_FALLBACK_ALIASES[provider];
+    if (fallbacks) {
+      for (const alt of fallbacks) {
+        const found = lookupCached(alt);
+        if (found) return found;
+      }
+    }
+    return null;
   }
 
+  // Cold path: hit SQLite. Prepare the statement once, reuse for every alias.
   const db = getDbInstance();
   ensureCapabilitiesTable();
-  const row = db
-    .prepare("SELECT * FROM model_capabilities WHERE provider = ? AND model_id = ? LIMIT 1")
-    .get(provider, modelId);
-  if (!row) return null;
-  return mapCapabilityRecord(toRecord(row));
+  const stmt = db.prepare(
+    "SELECT * FROM model_capabilities WHERE provider = ? AND model_id = ? LIMIT 1"
+  );
+  const lookupDb = (p: string): ModelCapabilityEntry | null => {
+    const row = stmt.get(p, modelId);
+    if (!row) return null;
+    return mapCapabilityRecord(toRecord(row));
+  };
+
+  const direct = lookupDb(provider);
+  if (direct) return direct;
+
+  const fallbacks = SYNCED_CAPABILITY_FALLBACK_ALIASES[provider];
+  if (fallbacks) {
+    for (const alt of fallbacks) {
+      const found = lookupDb(alt);
+      if (found) return found;
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -598,55 +711,93 @@ export function clearModelsDevCapabilities(): void {
 export async function syncModelsDev(opts?: {
   dryRun?: boolean;
   syncCapabilities?: boolean;
+  maxRetries?: number;
+  signal?: AbortSignal;
 }): Promise<SyncResult> {
   const dryRun = opts?.dryRun ?? false;
   const syncCapabilities = opts?.syncCapabilities ?? true;
+  const maxRetries = opts?.maxRetries ?? 3;
+  const signal = opts?.signal;
 
-  try {
-    const raw = await fetchModelsDev();
-    const pricing = transformModelsDevToPricing(raw);
-    const capabilities = syncCapabilities ? transformModelsDevToCapabilities(raw) : {};
+  let lastError: Error | null = null;
 
-    const modelCount = Object.values(pricing).reduce(
-      (sum, models) => sum + Object.keys(models).length,
-      0
-    );
-    const providerCount = Object.keys(pricing).length;
-    const capabilityCount = syncCapabilities
-      ? Object.values(capabilities).reduce((sum, models) => sum + Object.keys(models).length, 0)
-      : 0;
-
-    if (!dryRun) {
-      saveModelsDevPricing(pricing);
-      if (syncCapabilities) {
-        ensureCapabilitiesTable();
-        saveModelsDevCapabilities(capabilities);
-      }
-      lastSyncTime = new Date().toISOString();
-      lastSyncModelCount = modelCount;
-      lastSyncCapabilityCount = capabilityCount;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (signal?.aborted) {
+      return createAbortedSyncResult(dryRun);
     }
 
-    return {
-      success: true,
-      modelCount,
-      providerCount,
-      capabilityCount,
-      dryRun,
-      ...(dryRun ? { data: { pricing, capabilities } } : {}),
-    };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.warn("[MODELS_DEV] Sync failed:", message);
-    return {
-      success: false,
-      modelCount: 0,
-      providerCount: 0,
-      capabilityCount: 0,
-      dryRun,
-      error: message,
-    };
+    try {
+      const raw = await fetchModelsDev(signal);
+      const pricing = transformModelsDevToPricing(raw);
+      const capabilities = syncCapabilities ? transformModelsDevToCapabilities(raw) : {};
+
+      const modelCount = Object.values(pricing).reduce(
+        (sum, models) => sum + Object.keys(models).length,
+        0
+      );
+      const providerCount = Object.keys(pricing).length;
+      const capabilityCount = syncCapabilities
+        ? Object.values(capabilities).reduce((sum, models) => sum + Object.keys(models).length, 0)
+        : 0;
+
+      if (signal?.aborted) {
+        return createAbortedSyncResult(dryRun);
+      }
+
+      if (!dryRun) {
+        saveModelsDevPricing(pricing);
+        if (syncCapabilities) {
+          ensureCapabilitiesTable();
+          saveModelsDevCapabilities(capabilities);
+        }
+        lastSyncTime = new Date().toISOString();
+        lastSyncModelCount = modelCount;
+        lastSyncCapabilityCount = capabilityCount;
+      }
+
+      return {
+        success: true,
+        modelCount,
+        providerCount,
+        capabilityCount,
+        dryRun,
+        ...(dryRun ? { data: { pricing, capabilities } } : {}),
+      };
+    } catch (err) {
+      if (signal?.aborted || isAbortError(err)) {
+        return createAbortedSyncResult(dryRun);
+      }
+
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (attempt < maxRetries) {
+        const delayMs = Math.pow(2, attempt) * 1000; // Exponential backoff: 1s, 2s, 4s
+        console.warn(
+          `[MODELS_DEV] Sync attempt ${attempt + 1} failed, retrying in ${delayMs}ms:`,
+          lastError.message
+        );
+        try {
+          await sleepWithAbort(delayMs, signal);
+        } catch (sleepError) {
+          if (signal?.aborted || isAbortError(sleepError)) {
+            return createAbortedSyncResult(dryRun);
+          }
+          throw sleepError;
+        }
+      }
+    }
   }
+
+  const message = lastError?.message || "Unknown error";
+  console.warn(`[MODELS_DEV] Sync failed after ${maxRetries + 1} attempts:`, message);
+  return {
+    success: false,
+    modelCount: 0,
+    providerCount: 0,
+    capabilityCount: 0,
+    dryRun,
+    error: message,
+  };
 }
 
 // ─── Periodic sync ───────────────────────────────────────
@@ -659,10 +810,33 @@ export function startPeriodicSync(intervalMs?: number): void {
 
   const interval = intervalMs ?? SYNC_INTERVAL_MS;
   activeSyncIntervalMs = interval;
+  const syncToken = { stopped: false };
+  activePeriodicSyncToken = syncToken;
   console.log(`[MODELS_DEV] Starting periodic sync every ${interval / 1000}s`);
 
+  const launchSync = () => {
+    if (syncToken.stopped) {
+      return Promise.resolve(createAbortedSyncResult(false));
+    }
+
+    if (activeSyncPromise) return activeSyncPromise;
+
+    const controller = new AbortController();
+    activeSyncAbortController = controller;
+    const promise = syncModelsDev({ signal: controller.signal }).finally(() => {
+      if (activeSyncAbortController === controller) {
+        activeSyncAbortController = null;
+      }
+      if (activeSyncPromise === promise) {
+        activeSyncPromise = null;
+      }
+    });
+    activeSyncPromise = promise;
+    return promise;
+  };
+
   // Initial sync (non-blocking)
-  syncModelsDev()
+  launchSync()
     .then((result) => {
       if (result.success) {
         console.log(
@@ -675,7 +849,7 @@ export function startPeriodicSync(intervalMs?: number): void {
     });
 
   syncTimer = setInterval(() => {
-    syncModelsDev()
+    launchSync()
       .then((result) => {
         if (result.success) {
           console.log(`[MODELS_DEV] Periodic sync complete: ${result.modelCount} pricing entries`);
@@ -695,6 +869,16 @@ export function startPeriodicSync(intervalMs?: number): void {
  * Stop periodic sync and cleanup timer.
  */
 export function stopPeriodicSync(): void {
+  if (activePeriodicSyncToken) {
+    activePeriodicSyncToken.stopped = true;
+    activePeriodicSyncToken = null;
+  }
+
+  if (activeSyncAbortController) {
+    activeSyncAbortController.abort();
+    activeSyncAbortController = null;
+  }
+
   if (syncTimer) {
     clearInterval(syncTimer);
     syncTimer = null;
@@ -737,13 +921,4 @@ export async function initModelsDevSync(): Promise<void> {
 
   const interval = settings.modelsDevSyncInterval as number | undefined;
   startPeriodicSync(interval);
-}
-
-/**
- * Get context window limit for a specific model from synced capabilities.
- * Returns null if not available.
- */
-export function getModelContextLimit(provider: string, modelId: string): number | null {
-  const caps = getSyncedCapabilities(provider, modelId);
-  return caps[provider]?.[modelId]?.limit_context ?? null;
 }

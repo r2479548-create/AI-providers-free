@@ -348,7 +348,7 @@ MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
 XcW+ML9FoCI6AOvOzwIDAQAB
 -----END PUBLIC KEY-----`;
 
-function buildCosyHeadersForValidation(bodyStr: string, token: string) {
+export function buildCosyHeadersForValidation(bodyStr: string, token: string) {
   const aesKeyBytes = crypto.randomBytes(16);
   const aesKeyStr = aesKeyBytes.toString("hex").slice(0, 16);
   const aesKeyBuf = Buffer.from(aesKeyStr, "utf8");
@@ -393,6 +393,121 @@ function buildCosyHeadersForValidation(bodyStr: string, token: string) {
   };
 }
 
+// #4683: Qoder PATs (`pt-*`) cannot be used directly as the Cosy
+// `security_oauth_token`. The official qodercli performs a two-step flow: it first
+// exchanges the PAT for a short-lived job token (`jt-*`) at
+// `openapi.qoder.sh/api/v1/jobToken/exchange`, then carries that `jt-*` in the Cosy
+// envelope for chat. Passing the raw `pt-*` makes Cosy return a generic 500, which
+// OmniRoute mis-surfaced as "PAT may not be valid for the chat API". We mirror the
+// exchange here and cache the `jt-*` for its lifetime.
+const QODER_JOB_TOKEN_EXCHANGE_URL = "https://openapi.qoder.sh/api/v1/jobToken/exchange";
+// Refresh a little before the ~24h expiry to avoid using a just-expired token.
+const QODER_JOB_TOKEN_DEFAULT_TTL_MS = 23 * 60 * 60 * 1000;
+const QODER_JOB_TOKEN_MIN_TTL_MS = 60 * 1000;
+
+type QoderJobTokenCacheEntry = { jobToken: string; expiresAt: number };
+const qoderJobTokenCache = new Map<string, QoderJobTokenCacheEntry>();
+const qoderJobTokenPending = new Map<
+  string,
+  Promise<{ jobToken: string; expiresInMs: number } | null>
+>();
+
+type FetchLike = (input: string, init?: Record<string, unknown>) => Promise<Response>;
+
+/** A Qoder Personal Access Token is the only credential that needs the exchange. */
+export function isQoderPatToken(token: string): boolean {
+  return typeof token === "string" && token.trim().startsWith("pt-");
+}
+
+/** Pull a `jt-*` job token out of the (loosely-specified) exchange response. */
+export function parseQoderJobTokenResponse(json: unknown): {
+  jobToken: string;
+  expiresInMs: number;
+} | null {
+  const root = asRecord(json);
+  const data = asRecord(root.data);
+  const candidates = [
+    root.job_token,
+    root.jobToken,
+    root.jt,
+    root.token,
+    data.job_token,
+    data.jobToken,
+    data.jt,
+    data.token,
+  ];
+  const jobToken = candidates.map(getString).find((v) => v.trim().startsWith("jt-")) || "";
+  if (!jobToken) return null;
+
+  const expiresRaw = [root.expires_in, root.expiresIn, data.expires_in, data.expiresIn].find(
+    (v) => typeof v === "number" && Number.isFinite(v) && (v as number) > 0
+  ) as number | undefined;
+  // Qoder reports expiry in seconds; fall back to the default ~24h window.
+  const expiresInMs = expiresRaw ? expiresRaw * 1000 : QODER_JOB_TOKEN_DEFAULT_TTL_MS;
+  return { jobToken, expiresInMs: Math.max(expiresInMs, QODER_JOB_TOKEN_MIN_TTL_MS) };
+}
+
+/** Exchange a `pt-*` PAT for a short-lived `jt-*` job token (no caching). */
+export async function exchangeQoderJobToken(
+  pat: string,
+  options: { fetchImpl?: FetchLike; signal?: AbortSignal | null } = {}
+): Promise<{ jobToken: string; expiresInMs: number } | null> {
+  const fetchImpl = options.fetchImpl || (fetch as unknown as FetchLike);
+  const res = await fetchImpl(QODER_JOB_TOKEN_EXCHANGE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ personal_token: pat }),
+    signal: options.signal || AbortSignal.timeout(15000),
+  });
+  if (!res || !res.ok) return null;
+  let json: unknown = null;
+  try {
+    json = await res.json();
+  } catch {
+    return null;
+  }
+  return parseQoderJobTokenResponse(json);
+}
+
+/**
+ * Resolve the token to carry in the Cosy envelope. For a `pt-*` PAT this returns a
+ * cached/freshly-exchanged `jt-*` job token; any other token (already a `jt-*`, or a
+ * non-PAT credential) is returned unchanged. Exchange failures fall back to the
+ * original token so behavior is no worse than before the fix.
+ */
+export async function resolveQoderJobToken(
+  token: string,
+  options: { fetchImpl?: FetchLike; signal?: AbortSignal | null; now?: number } = {}
+): Promise<string> {
+  const trimmed = (token || "").trim();
+  if (!isQoderPatToken(trimmed)) return trimmed;
+
+  const now = options.now ?? Date.now();
+  const cached = qoderJobTokenCache.get(trimmed);
+  if (cached && cached.expiresAt > now) return cached.jobToken;
+
+  let pending = qoderJobTokenPending.get(trimmed);
+  if (!pending) {
+    pending = exchangeQoderJobToken(trimmed, { fetchImpl: options.fetchImpl }).finally(() => {
+      qoderJobTokenPending.delete(trimmed);
+    });
+    qoderJobTokenPending.set(trimmed, pending);
+  }
+  const exchanged = await pending;
+  if (!exchanged) return trimmed; // graceful fallback — keep prior behavior
+  qoderJobTokenCache.set(trimmed, {
+    jobToken: exchanged.jobToken,
+    expiresAt: now + exchanged.expiresInMs,
+  });
+  return exchanged.jobToken;
+}
+
+/** Test-only: clear the job-token cache so unit tests don't leak state. */
+export function __clearQoderJobTokenCache(): void {
+  qoderJobTokenCache.clear();
+  qoderJobTokenPending.clear();
+}
+
 export async function validateQoderCliPat({
   apiKey,
   providerSpecificData = {},
@@ -401,7 +516,8 @@ export async function validateQoderCliPat({
   providerSpecificData?: JsonRecord;
 }) {
   // Resolve token: dashboard input → env var fallback
-  const resolvedToken = apiKey?.trim() || String(process.env.QODER_PERSONAL_ACCESS_TOKEN || "").trim();
+  const resolvedToken =
+    apiKey?.trim() || String(process.env.QODER_PERSONAL_ACCESS_TOKEN || "").trim();
 
   if (!resolvedToken) {
     return {
@@ -460,8 +576,10 @@ export async function validateQoderCliPat({
     };
   }
 
-  // Step 2: Auth validation — send a minimal request with the PAT
-  const headers = buildCosyHeadersForValidation(bodyStr, resolvedToken);
+  // Step 2: Auth validation — exchange the PAT for a job token (#4683), then send a
+  // minimal request with the `jt-*` (Cosy rejects a raw `pt-*` with a generic 500).
+  const cosyToken = await resolveQoderJobToken(resolvedToken);
+  const headers = buildCosyHeadersForValidation(bodyStr, cosyToken);
   const endpoint =
     "https://api1.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?AgentId=agent_common";
 
@@ -500,6 +618,37 @@ export async function validateQoderCliPat({
     // 4xx other than auth — token was accepted but request had issues (model, format, etc.)
     if (res.status >= 400 && res.status < 500) {
       return { valid: true, error: null, unsupported: false };
+    }
+
+    // Treat 5xx as a valid bypass to prevent false negatives from legacy Qoder APIs (#1391).
+    // A Cosy `{"success":false}` 500 is ambiguous: it can be a genuine auth rejection OR a
+    // transient/generic upstream "Internal Server Error". Only mark the PAT invalid when the
+    // body carries an EXPLICIT auth signal — a generic 500 is a server fault, not an auth
+    // verdict, so a working PAT must not be reported as expired (#3247, narrowing #2860).
+    if (res.status >= 500) {
+      const isCosyResponse = /"success"\s*:\s*false/.test(errorDetail);
+      const hasAuthSignal =
+        /(unauthorized|forbidden|expired|revoked|not\s*authorized|permission\s*denied|access\s*denied|invalid\s*(?:token|credential|api[\s_-]*key)|token\s*(?:invalid|expired|revoked))/i.test(
+          errorDetail
+        );
+
+      if (isCosyResponse && hasAuthSignal) {
+        return {
+          valid: false,
+          error:
+            `Authentication failed (HTTP ${res.status}). The Qoder Cosy server rejected the token ` +
+            "as invalid, expired, or not authorized. " +
+            "Please check your token at https://qoder.com/account/integrations." +
+            (errorDetail ? ` Server response: ${errorDetail}` : ""),
+          unsupported: false,
+        };
+      }
+
+      return {
+        valid: true,
+        error: `Validation endpoint returned HTTP ${res.status}${errorDetail ? `: ${errorDetail}` : ""}, treating PAT as valid`,
+        unsupported: false,
+      };
     }
 
     return {
